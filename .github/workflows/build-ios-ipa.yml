@@ -1,0 +1,176 @@
+name: Build CardboardXR Desktop IPA
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: Attach IPA to a GitHub Release
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-ios-ipa:
+    name: Build Unsigned iOS IPA
+    runs-on: macos-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Ensure ParsecSDK.framework is staged
+        run: |
+          FW="Assets/Plugins/iOS/ParsecSDK.framework"
+          if [ ! -f "$FW/ParsecSDK" ] || [ ! -f "$FW/Headers/parsec.h" ]; then
+            mkdir -p "$FW/Headers" "$FW/Modules"
+            BASE="https://raw.githubusercontent.com/MalfoyJW/parsec-sdk/bb336699ee7acd7a4eb0c460410a65c23d7f3879"
+            curl -fsSL "$BASE/Headers/parsec.h" -o "$FW/Headers/parsec.h"
+            curl -fsSL "$BASE/Info.plist" -o "$FW/Info.plist"
+            curl -fsSL "$BASE/Modules/module.modulemap" -o "$FW/Modules/module.modulemap"
+            curl -fsSL "$BASE/ParsecSDK" -o "$FW/ParsecSDK"
+          fi
+
+      - name: Check pre-exported Xcode project
+        id: check_xcode
+        run: |
+          if [ -d "Builds/iOS/Unity-iPhone.xcodeproj" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check Unity license availability
+        id: check_license
+        if: steps.check_xcode.outputs.exists == 'false'
+        env:
+          HAS_SECRET: ${{ secrets.UNITY_LICENSE != '' }}
+        run: |
+          if [ "$HAS_SECRET" = "true" ] || [ -f "Unity_lic.ulf" ]; then
+            echo "has_license=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_license=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Unity Hub and Unity 6000.6.8f1 with iOS support
+        if: steps.check_xcode.outputs.exists == 'false'
+        run: |
+          brew install --cask unity-hub
+          UNITY_HUB="/Applications/Unity Hub.app/Contents/MacOS/Unity Hub"
+          if [ ! -x "/Applications/Unity/Hub/Editor/6000.6.8f1/Unity.app/Contents/MacOS/Unity" ]; then
+            "$UNITY_HUB" -- --headless install --version 6000.6.8f1 --changeset 237b6593792b --module ios --childModules
+          fi
+
+      - name: Cache Unity Library
+        if: steps.check_xcode.outputs.exists == 'false' && steps.check_license.outputs.has_license == 'true'
+        uses: actions/cache@v4
+        with:
+          path: Library
+          key: unity-ios-${{ hashFiles('Packages/manifest.json', 'Packages/packages-lock.json', 'ProjectSettings/ProjectVersion.txt') }}
+          restore-keys: |
+            unity-ios-
+
+      - name: Generate Unity manual activation file (.alf) if license is missing
+        if: steps.check_xcode.outputs.exists == 'false' && steps.check_license.outputs.has_license == 'false'
+        run: |
+          mkdir -p /tmp/unity_alf
+          cd /tmp/unity_alf
+          /Applications/Unity/Hub/Editor/6000.6.8f1/Unity.app/Contents/MacOS/Unity \
+            -batchmode -nographics -createManualActivationFile -logfile /tmp/alf.log || true
+          ls -la /tmp/unity_alf
+
+      - name: Upload Unity manual activation file (.alf)
+        if: steps.check_xcode.outputs.exists == 'false' && steps.check_license.outputs.has_license == 'false'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Unity-Manual-Activation-ALF
+          path: /tmp/unity_alf/*.alf
+          retention-days: 7
+
+      - name: Fail with activation instructions when Unity license is absent
+        if: steps.check_xcode.outputs.exists == 'false' && steps.check_license.outputs.has_license == 'false'
+        run: |
+          echo "Unity license (.ulf) not found."
+          echo "Download the Unity-Manual-Activation-ALF artifact from this run,"
+          echo "activate it at https://license.unity3d.com/manual to get Unity_lic.ulf,"
+          echo "and save its contents as the UNITY_LICENSE repository secret."
+          exit 1
+
+      - name: Activate Unity license and export iOS Xcode project
+        if: steps.check_xcode.outputs.exists == 'false' && steps.check_license.outputs.has_license == 'true'
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+        run: |
+          UNITY_BIN="/Applications/Unity/Hub/Editor/6000.6.8f1/Unity.app/Contents/MacOS/Unity"
+          sudo mkdir -p "/Library/Application Support/Unity"
+          if [ -n "$UNITY_LICENSE" ]; then
+            printf '%s' "$UNITY_LICENSE" | sudo tee "/Library/Application Support/Unity/Unity_lic.ulf" >/dev/null
+          else
+            sudo cp "Unity_lic.ulf" "/Library/Application Support/Unity/Unity_lic.ulf"
+          fi
+          "$UNITY_BIN" -batchmode -quit -manualLicenseFile "/Library/Application Support/Unity/Unity_lic.ulf" -logfile /tmp/unity_lic.log || true
+          "$UNITY_BIN" -batchmode -quit -projectPath "$PWD" -buildTarget iOS \
+            -executeMethod ProjectBootstrap.StereoBuilder.BuildIos -logFile /tmp/unity_ios.log || {
+              tail -n 80 /tmp/unity_ios.log
+              exit 1
+            }
+
+      - name: Verify exported Xcode project
+        run: |
+          if [ ! -d "Builds/iOS/Unity-iPhone.xcodeproj" ]; then
+            echo "Expected Builds/iOS/Unity-iPhone.xcodeproj was not produced."
+            exit 1
+          fi
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Archive unsigned iOS app
+        run: |
+          xcodebuild archive \
+            -project Builds/iOS/Unity-iPhone.xcodeproj \
+            -scheme Unity-iPhone \
+            -archivePath build/CardboardXR.xcarchive \
+            -sdk iphoneos \
+            -arch arm64 \
+            -configuration Release \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Fake-sign frameworks and package IPA for Sideloadly / SideStore
+        run: |
+          brew install ldid
+          APP_PATH=$(ls -d build/CardboardXR.xcarchive/Products/Applications/*.app | head -1)
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app found inside archive."
+            exit 1
+          fi
+          find "$APP_PATH" -type d -path '*/Frameworks/*.framework' -exec ldid -S {} \;
+          ldid -S "$APP_PATH"
+          mkdir -p build/Payload
+          cp -R "$APP_PATH" build/Payload/
+          cd build
+          zip -r -9 CardboardXR-Desktop.ipa Payload
+          ls -lh CardboardXR-Desktop.ipa
+
+      - name: Upload CardboardXR-Desktop IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: CardboardXR-Desktop-IPA
+          path: build/CardboardXR-Desktop.ipa
+          retention-days: 14
+
+      - name: Publish Release
+        if: github.event_name != 'pull_request' && (inputs.create_release == true || github.ref == 'refs/heads/main')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: desktop-v${{ github.run_number }}
+          files: build/CardboardXR-Desktop.ipa

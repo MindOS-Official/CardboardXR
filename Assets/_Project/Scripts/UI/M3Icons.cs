@@ -53,6 +53,16 @@ namespace CardboardXR.UI
             ["front_hand"] = 0xe769,
             ["apps"] = 0xe5c3,
             ["bolt"] = 0xea0b,
+            ["desktop_windows"] = 0xe30c,
+            ["computer"] = 0xe30a,
+            ["language"] = 0xe894,
+            ["keyboard"] = 0xe312,
+            ["volume_up"] = 0xe050,
+            ["volume_off"] = 0xe04f,
+            ["backspace"] = 0xe14a,
+            ["arrow_back"] = 0xe5c4,
+            ["arrow_forward"] = 0xe5c8,
+            ["search"] = 0xe8b6,
         };
 
         // The icon's character, for a TMP text set in the icon font; empty for an unknown name.
