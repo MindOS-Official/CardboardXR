@@ -16,6 +16,7 @@ int VRParsecConnect(const char *sessionId, const char *peerId, int width, int he
 void VRParsecDisconnect(void);
 int VRParsecGetStatus(int *outWidth, int *outHeight, int *outNetworkFailure);
 void VRParsecSetSecondStreamEnabled(int enabled);
+id VRParsecPollStreamTexture(int streamIndex, int *outUpdated);
 UIImage *VRParsecPollStreamImage(int streamIndex, int timeoutMs);
 void VRParsecSendStreamMousePosition(int streamIndex, int x, int y);
 void VRParsecSendMouseButton(int button, int pressed);

@@ -13,13 +13,13 @@ namespace CardboardXR.Demos.Desktop
     public class DesktopDemo : Demo, IPinchHandler
     {
         const string KeychainSessionKey = "cardboardxr_parsec_session_v1";
-        const float k_ParsecDistance = 1.85f;
+        const float k_ParsecDistance = 1.45f;
         const float k_WebSideYaw = 34f;
         const float k_WebSideDistance = 1.75f;
         const float k_WebRefreshInterval = 1f / 30f;
 
-        static readonly float[] k_MonitorScales = { 1.0f, 1.35f, 1.70f };
-        static readonly string[] k_SizePresetLabels = { "Normal", "Giant", "IMAX" };
+        static readonly float[] k_MonitorScales = { 1.15f, 1.50f, 1.90f };
+        static readonly string[] k_SizePresetLabels = { "Big", "Giant", "IMAX" };
         static readonly Vector3[] k_SideMonitorAngles =
         {
             new Vector3(-38f, -4f, 1.78f),

@@ -1,8 +1,10 @@
 // ParsecSDK dual-stream native client, AudioQueue stereo PCM output, NV12 frame converter, and Keychain helpers.
 
 #import "VRBridge.h"
+#import <Accelerate/Accelerate.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <Metal/Metal.h>
 #import <Security/Security.h>
 #include <algorithm>
 #include <atomic>
@@ -234,7 +236,13 @@ namespace
     struct FrameBufferState
     {
         std::mutex mutex;
+        std::vector<uint8_t> stagingBgra;
         std::vector<uint8_t> bgra;
+        id<MTLTexture> textures[2] = {nil, nil};
+        int texW = 0;
+        int texH = 0;
+        int writeIdx = 0;
+        int readyIdx = -1;
         int width = 0;
         int height = 0;
         bool updated = false;
@@ -245,14 +253,93 @@ namespace
     AudioContext *g_audio = nullptr;
     FrameBufferState g_frames[kMaxParsecStreams];
     std::atomic<int> g_pollGeneration{0};
+    std::atomic<int> g_activeWorkers{0};
+    std::atomic<bool> g_secondStreamEnabled{false};
+    std::atomic<int> g_lastStatus{PARSEC_NOT_RUNNING};
+    std::atomic<int> g_netFailure{0};
     std::atomic<int> g_hostWidth{1920};
     std::atomic<int> g_hostHeight{1080};
+
+    id<MTLDevice> GetMetalDevice()
+    {
+        static id<MTLDevice> dev = nil;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            dev = MTLCreateSystemDefaultDevice();
+        });
+        return dev;
+    }
+
+    const vImage_YpCbCrToARGB *GetBt601Info()
+    {
+        static vImage_YpCbCrToARGB info;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            vImage_YpCbCrPixelRange range = {16, 128, 235, 240, 255, 0, 255, 0};
+            vImageConvert_YpCbCrToARGB_GenerateConversion(
+                kvImage_YpCbCrToARGBMatrix_ITU_R_601_4,
+                &range,
+                &info,
+                kvImage420Yp8_CbCr8,
+                kvImageARGB8888,
+                kvImageNoFlags);
+        });
+        return &info;
+    }
 
     void ParsecLogHandler(ParsecLogLevel level, const char *msg, void *opaque)
     {
         (void)opaque;
         if (msg)
             NSLog(@"[ParsecSDK:%@] %s", level == LOG_DEBUG ? @"D" : @"I", msg);
+    }
+
+    void UploadFrameToTexture(FrameBufferState *slot, int w, int h)
+    {
+        id<MTLDevice> dev = GetMetalDevice();
+        if (!dev)
+            return;
+
+        if (slot->texW != w || slot->texH != h || !slot->textures[0] || !slot->textures[1])
+        {
+            MTLTextureDescriptor *desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                            width:static_cast<NSUInteger>(w)
+                                                                                           height:static_cast<NSUInteger>(h)
+                                                                                        mipmapped:NO];
+            desc.usage = MTLTextureUsageShaderRead;
+            desc.storageMode = MTLStorageModeShared;
+            id<MTLTexture> t0 = [dev newTextureWithDescriptor:desc];
+            id<MTLTexture> t1 = [dev newTextureWithDescriptor:desc];
+            std::lock_guard<std::mutex> lock(slot->mutex);
+            slot->textures[0] = t0;
+            slot->textures[1] = t1;
+            slot->texW = w;
+            slot->texH = h;
+            slot->readyIdx = -1;
+            slot->writeIdx = 0;
+        }
+
+        int idx = 0;
+        id<MTLTexture> targetTex = nil;
+        {
+            std::lock_guard<std::mutex> lock(slot->mutex);
+            idx = (slot->readyIdx == 0) ? 1 : 0;
+            targetTex = slot->textures[idx];
+        }
+        if (!targetTex)
+            return;
+
+        [targetTex replaceRegion:MTLRegionMake2D(0, 0, static_cast<NSUInteger>(w), static_cast<NSUInteger>(h))
+                     mipmapLevel:0
+                       withBytes:slot->stagingBgra.data()
+                     bytesPerRow:static_cast<NSUInteger>(w) * 4];
+
+        std::lock_guard<std::mutex> lock(slot->mutex);
+        slot->width = w;
+        slot->height = h;
+        slot->readyIdx = idx;
+        slot->writeIdx = 1 - idx;
+        slot->updated = true;
     }
 
     void FrameUploadCallback(const ParsecFrame *frame, const void *image, void *opaque)
@@ -269,64 +356,93 @@ namespace
             return;
 
         const uint8_t *src = static_cast<const uint8_t *>(image);
-        std::lock_guard<std::mutex> lock(slot->mutex);
-        slot->width = w;
-        slot->height = h;
-        slot->bgra.resize(static_cast<size_t>(w) * static_cast<size_t>(h) * 4);
+        slot->stagingBgra.resize(static_cast<size_t>(w) * static_cast<size_t>(h) * 4);
+        bool converted = false;
 
         if (frame->format == FORMAT_NV12 &&
             frame->size >= static_cast<uint32_t>(stride * rows + stride * ((h + 1) / 2)))
         {
             const uint8_t *yPlane = src;
             const uint8_t *uvPlane = src + (stride * rows);
-            uint8_t *dst = slot->bgra.data();
 
-            for (int y = 0; y < h; ++y)
+            vImage_Buffer srcYp = {const_cast<uint8_t *>(yPlane), static_cast<vImagePixelCount>(h), static_cast<vImagePixelCount>(w), static_cast<size_t>(stride)};
+            vImage_Buffer srcCbCr = {const_cast<uint8_t *>(uvPlane), static_cast<vImagePixelCount>((h + 1) / 2), static_cast<vImagePixelCount>((w + 1) / 2), static_cast<size_t>(stride)};
+            vImage_Buffer dstBgra = {slot->stagingBgra.data(), static_cast<vImagePixelCount>(h), static_cast<vImagePixelCount>(w), static_cast<size_t>(w) * 4};
+            const uint8_t permuteMap[4] = {3, 2, 1, 0};
+            vImage_Error err = vImageConvert_420Yp8_CbCr8ToARGB8888(&srcYp, &srcCbCr, &dstBgra, GetBt601Info(), permuteMap, 255, kvImageNoFlags);
+            if (err == kvImageNoError)
             {
-                const uint8_t *yRow = yPlane + (y * stride);
-                const uint8_t *uvRow = uvPlane + ((y >> 1) * stride);
-                uint8_t *outRow = dst + (y * w * 4);
-                for (int x = 0; x < w; ++x)
-                {
-                    int c = static_cast<int>(yRow[x]) - 16;
-                    int uvIdx = (x & ~1);
-                    int d = static_cast<int>(uvRow[uvIdx]) - 128;
-                    int e = static_cast<int>(uvRow[uvIdx + 1]) - 128;
-
-                    int y298 = 298 * c;
-                    uint8_t r = ClampByte((y298 + 409 * e + 128) >> 8);
-                    uint8_t g = ClampByte((y298 - 100 * d - 208 * e + 128) >> 8);
-                    uint8_t b = ClampByte((y298 + 516 * d + 128) >> 8);
-
-                    int o = x * 4;
-                    outRow[o + 0] = b;
-                    outRow[o + 1] = g;
-                    outRow[o + 2] = r;
-                    outRow[o + 3] = 255;
-                }
+                converted = true;
             }
-            slot->updated = true;
-            if (slot == &g_frames[0])
+            else
             {
-                g_hostWidth.store(w);
-                g_hostHeight.store(h);
+                uint8_t *dst = slot->stagingBgra.data();
+                for (int y = 0; y < h; ++y)
+                {
+                    const uint8_t *yRow = yPlane + (y * stride);
+                    const uint8_t *uvRow = uvPlane + ((y >> 1) * stride);
+                    uint8_t *outRow = dst + (y * w * 4);
+                    for (int x = 0; x < w; ++x)
+                    {
+                        int c = static_cast<int>(yRow[x]) - 16;
+                        int uvIdx = (x & ~1);
+                        int d = static_cast<int>(uvRow[uvIdx]) - 128;
+                        int e = static_cast<int>(uvRow[uvIdx + 1]) - 128;
+                        int y298 = 298 * c;
+                        int o = x * 4;
+                        outRow[o + 0] = ClampByte((y298 + 516 * d + 128) >> 8);
+                        outRow[o + 1] = ClampByte((y298 - 100 * d - 208 * e + 128) >> 8);
+                        outRow[o + 2] = ClampByte((y298 + 409 * e + 128) >> 8);
+                        outRow[o + 3] = 255;
+                    }
+                }
+                converted = true;
             }
         }
         else if (frame->format == FORMAT_BGRA && frame->size >= static_cast<uint32_t>(stride * h * 4))
         {
             for (int y = 0; y < h; ++y)
-                std::memcpy(slot->bgra.data() + y * w * 4, src + y * stride * 4, static_cast<size_t>(w) * 4);
-            slot->updated = true;
-            if (slot == &g_frames[0])
-            {
-                g_hostWidth.store(w);
-                g_hostHeight.store(h);
-            }
+                std::memcpy(slot->stagingBgra.data() + y * w * 4, src + y * stride * 4, static_cast<size_t>(w) * 4);
+            converted = true;
         }
+
+        if (!converted)
+            return;
+
+        if (slot == &g_frames[0])
+        {
+            g_hostWidth.store(w);
+            g_hostHeight.store(h);
+        }
+
+        UploadFrameToTexture(slot, w, h);
     }
 
     void StartBackgroundThreads(int generation)
     {
+        g_activeWorkers.fetch_add(3);
+
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+            while (g_pollGeneration.load() == generation)
+            {
+                Parsec *ps = nullptr;
+                {
+                    std::lock_guard<std::mutex> lock(g_parsecMutex);
+                    ps = g_parsec;
+                }
+                if (!ps)
+                    break;
+                ParsecStatus st = ParsecClientPollFrame(ps, 0, FrameUploadCallback, 4, &g_frames[0]);
+                if (st == PARSEC_OK || st < 0)
+                    g_lastStatus.store(static_cast<int>(st));
+                if (g_secondStreamEnabled.load())
+                    ParsecClientPollFrame(ps, 1, FrameUploadCallback, 1, &g_frames[1]);
+                if (st == PARSEC_NOT_RUNNING)
+                    usleep(16000);
+            }
+            g_activeWorkers.fetch_sub(1);
+        });
+
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
             while (g_pollGeneration.load() == generation)
             {
@@ -342,6 +458,7 @@ namespace
                 if (ParsecClientPollAudio(ps, AudioCallback, 16, au) == PARSEC_NOT_RUNNING)
                     usleep(30000);
             }
+            g_activeWorkers.fetch_sub(1);
         });
 
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
@@ -354,6 +471,17 @@ namespace
                 }
                 if (!ps)
                     break;
+
+                ParsecClientStatus pcs{};
+                ParsecStatus cst = ParsecClientGetStatus(ps, &pcs);
+                g_lastStatus.store(static_cast<int>(cst));
+                if (pcs.decoder[0].width > 0 && pcs.decoder[0].height > 0)
+                {
+                    g_hostWidth.store(static_cast<int>(pcs.decoder[0].width));
+                    g_hostHeight.store(static_cast<int>(pcs.decoder[0].height));
+                }
+                g_netFailure.store(pcs.networkFailure ? 1 : 0);
+
                 ParsecClientEvent ev{};
                 if (ParsecClientPollEvents(ps, 16, &ev))
                 {
@@ -375,6 +503,7 @@ namespace
                     usleep(10000);
                 }
             }
+            g_activeWorkers.fetch_sub(1);
         });
     }
 }
@@ -400,6 +529,9 @@ extern "C" int VRParsecInit(void)
 extern "C" void VRParsecDestroy(void)
 {
     g_pollGeneration.fetch_add(1);
+    g_secondStreamEnabled.store(false);
+    for (int i = 0; i < 40 && g_activeWorkers.load() > 0; ++i)
+        usleep(5000);
     std::lock_guard<std::mutex> lock(g_parsecMutex);
     if (g_parsec)
     {
@@ -434,6 +566,8 @@ extern "C" int VRParsecConnect(const char *sessionId, const char *peerId, int wi
     cfg.pngCursor = false;
 
     ParsecStatus status = ParsecClientConnect(g_parsec, &cfg, sessionId, peerId);
+    g_lastStatus.store(static_cast<int>(status));
+    g_netFailure.store(0);
     if (status == PARSEC_OK || status == PARSEC_CONNECTING)
     {
         int cw = width > 0 ? width : 1920;
@@ -449,6 +583,9 @@ extern "C" int VRParsecConnect(const char *sessionId, const char *peerId, int wi
 extern "C" void VRParsecDisconnect(void)
 {
     g_pollGeneration.fetch_add(1);
+    g_secondStreamEnabled.store(false);
+    g_lastStatus.store(PARSEC_NOT_RUNNING);
+    g_netFailure.store(0);
     std::lock_guard<std::mutex> lock(g_parsecMutex);
     if (g_parsec)
     {
@@ -462,60 +599,71 @@ extern "C" void VRParsecDisconnect(void)
     {
         std::lock_guard<std::mutex> flock(g_frames[i].mutex);
         g_frames[i].updated = false;
+        g_frames[i].readyIdx = -1;
     }
 }
 
 extern "C" int VRParsecGetStatus(int *outWidth, int *outHeight, int *outNetworkFailure)
 {
-    std::lock_guard<std::mutex> lock(g_parsecMutex);
-    if (!g_parsec)
-        return PARSEC_NOT_RUNNING;
-
-    ParsecClientStatus pcs{};
-    ParsecStatus st = ParsecClientGetStatus(g_parsec, &pcs);
-    if (pcs.decoder[0].width > 0 && pcs.decoder[0].height > 0)
-    {
-        g_hostWidth.store(static_cast<int>(pcs.decoder[0].width));
-        g_hostHeight.store(static_cast<int>(pcs.decoder[0].height));
-    }
     if (outWidth)
         *outWidth = g_hostWidth.load();
     if (outHeight)
         *outHeight = g_hostHeight.load();
     if (outNetworkFailure)
-        *outNetworkFailure = pcs.networkFailure ? 1 : 0;
-    return static_cast<int>(st);
+        *outNetworkFailure = g_netFailure.load();
+    return g_lastStatus.load();
 }
 
 extern "C" void VRParsecSetSecondStreamEnabled(int enabled)
 {
+    g_secondStreamEnabled.store(enabled != 0);
     std::lock_guard<std::mutex> lock(g_parsecMutex);
     if (g_parsec)
         ParsecClientEnableStream(g_parsec, 1, enabled != 0);
 }
 
-extern "C" UIImage *VRParsecPollStreamImage(int streamIndex, int timeoutMs)
+extern "C" id VRParsecPollStreamTexture(int streamIndex, int *outUpdated)
 {
+    if (outUpdated)
+        *outUpdated = 0;
     if (streamIndex < 0 || streamIndex >= kMaxParsecStreams)
         return nil;
 
-    Parsec *ps = nullptr;
+    FrameBufferState *slot = &g_frames[streamIndex];
+    std::lock_guard<std::mutex> flock(slot->mutex);
+    if (slot->readyIdx < 0)
+        return nil;
+    if (slot->updated)
     {
-        std::lock_guard<std::mutex> lock(g_parsecMutex);
-        ps = g_parsec;
+        slot->updated = false;
+        if (outUpdated)
+            *outUpdated = 1;
     }
-    if (!ps)
+    return slot->textures[slot->readyIdx];
+}
+
+extern "C" UIImage *VRParsecPollStreamImage(int streamIndex, int timeoutMs)
+{
+    (void)timeoutMs;
+    if (streamIndex < 0 || streamIndex >= kMaxParsecStreams)
         return nil;
 
     FrameBufferState *slot = &g_frames[streamIndex];
-    ParsecClientPollFrame(ps, static_cast<uint8_t>(streamIndex), FrameUploadCallback,
-                          static_cast<uint32_t>(timeoutMs > 0 ? timeoutMs : 1), slot);
-
     std::lock_guard<std::mutex> flock(slot->mutex);
-    if (!slot->updated || slot->width <= 0 || slot->height <= 0 || slot->bgra.empty())
+    if (!slot->updated || slot->readyIdx < 0 || slot->width <= 0 || slot->height <= 0)
+        return nil;
+
+    id<MTLTexture> tex = slot->textures[slot->readyIdx];
+    if (!tex)
         return nil;
 
     slot->updated = false;
+    slot->bgra.resize(static_cast<size_t>(slot->width) * static_cast<size_t>(slot->height) * 4);
+    [tex getBytes:slot->bgra.data()
+      bytesPerRow:static_cast<NSUInteger>(slot->width) * 4
+       fromRegion:MTLRegionMake2D(0, 0, static_cast<NSUInteger>(slot->width), static_cast<NSUInteger>(slot->height))
+      mipmapLevel:0];
+
     NSData *data = [NSData dataWithBytes:slot->bgra.data() length:slot->bgra.size()];
     CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
     CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();

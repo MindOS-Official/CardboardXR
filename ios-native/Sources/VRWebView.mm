@@ -10,6 +10,11 @@
 @property (nonatomic, assign) int height;
 @property (nonatomic, copy) NSString *currentUrl;
 @property (nonatomic, assign) BOOL loading;
+@property (nonatomic, strong) UIImage *cachedSnapshot;
+@property (nonatomic, assign) BOOL snapshotDirty;
+@property (nonatomic, assign) BOOL snapshotInFlight;
+@property (nonatomic, assign) CFTimeInterval lastSnapshotTime;
+@property (nonatomic, assign) CFTimeInterval boostUntil;
 @end
 
 @implementation VRWebHost
@@ -81,6 +86,7 @@
 {
     (void)navigation;
     self.loading = NO;
+    self.boostUntil = CACurrentMediaTime() + 2.0;
     if (webView.URL)
         self.currentUrl = webView.URL.absoluteString;
 }
@@ -226,28 +232,42 @@ extern "C" UIImage *VRWebSnapshotSlot(int slot)
     if (!host || !host.webView)
         return nil;
 
-    __block UIImage *img = nil;
-    dispatch_block_t capture = ^{
-        VRWebHost *h = HostForSlot(slot);
-        if (!h || !h.webView)
-            return;
-        CGSize sz = CGSizeMake(h.width, h.height);
-        UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
-        fmt.scale = 1.0;
-        fmt.opaque = YES;
-        UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:sz format:fmt];
-        img = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-            [[UIColor colorWithWhite:0.12 alpha:1.0] setFill];
-            [ctx fillRect:CGRectMake(0, 0, sz.width, sz.height)];
-            [h.webView.layer renderInContext:ctx.CGContext];
-        }];
-    };
+    CFTimeInterval now = CACurrentMediaTime();
+    CFTimeInterval interval = (now < host.boostUntil) ? 0.12 : 0.30;
+    if (!host.snapshotInFlight && (now - host.lastSnapshotTime) >= interval)
+    {
+        host.snapshotInFlight = YES;
+        host.lastSnapshotTime = now;
+        dispatch_block_t snapBlock = ^{
+            if (!host.webView)
+            {
+                host.snapshotInFlight = NO;
+                return;
+            }
+            WKSnapshotConfiguration *cfg = [[WKSnapshotConfiguration alloc] init];
+            cfg.snapshotWidth = @(host.width);
+            [host.webView takeSnapshotWithConfiguration:cfg completionHandler:^(UIImage *img, NSError *err) {
+                (void)err;
+                host.snapshotInFlight = NO;
+                if (img)
+                {
+                    host.cachedSnapshot = img;
+                    host.snapshotDirty = YES;
+                }
+            }];
+        };
+        if ([NSThread isMainThread])
+            snapBlock();
+        else
+            dispatch_async(dispatch_get_main_queue(), snapBlock);
+    }
 
-    if ([NSThread isMainThread])
-        capture();
-    else
-        dispatch_sync(dispatch_get_main_queue(), capture);
-    return img;
+    if (host.snapshotDirty && host.cachedSnapshot)
+    {
+        host.snapshotDirty = NO;
+        return host.cachedSnapshot;
+    }
+    return nil;
 }
 
 extern "C" void VRWebClickSlot(int slot, float normX, float normY)
@@ -256,6 +276,7 @@ extern "C" void VRWebClickSlot(int slot, float normX, float normY)
         VRWebHost *host = HostForSlot(slot);
         if (!host || !host.webView)
             return;
+        host.boostUntil = CACurrentMediaTime() + 2.0;
         float px = normX * host.width;
         float py = normY * host.height;
         NSString *js = [NSString stringWithFormat:
@@ -278,6 +299,7 @@ extern "C" void VRWebScrollSlot(int slot, float normX, float normY, float deltaY
         VRWebHost *host = HostForSlot(slot);
         if (!host || !host.webView)
             return;
+        host.boostUntil = CACurrentMediaTime() + 2.0;
         float px = normX * host.width;
         float py = normY * host.height;
         NSString *js = [NSString stringWithFormat:
@@ -297,6 +319,7 @@ extern "C" void VRWebTypeKeySlot(int slot, const char *text, int isBackspace, in
         VRWebHost *host = HostForSlot(slot);
         if (!host || !host.webView)
             return;
+        host.boostUntil = CACurrentMediaTime() + 2.0;
         NSString *js = [NSString stringWithFormat:
             @"(function(){"
             "var el = document.activeElement;"

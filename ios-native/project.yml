@@ -31,6 +31,7 @@ targets:
         embed: true
         codeSign: false
       - sdk: ARKit.framework
+      - sdk: Accelerate.framework
       - sdk: SceneKit.framework
       - sdk: Vision.framework
       - sdk: WebKit.framework
