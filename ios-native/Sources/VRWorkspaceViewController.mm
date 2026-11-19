@@ -7,6 +7,7 @@
 #import <ARKit/ARKit.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreImage/CoreImage.h>
+#import <Metal/Metal.h>
 #import <SceneKit/SceneKit.h>
 #import <Vision/Vision.h>
 #include <algorithm>
@@ -16,12 +17,63 @@
 namespace
 {
     constexpr float kEyeSeparation = 0.063f;
-    constexpr float kParsecDist = 1.42f;
-    constexpr float kSideMonitorDist = 1.46f;
-    constexpr float kKeyboardDist = 1.08f;
-    constexpr float kKeyboardPitchDeg = -18.0f;
-    constexpr CFTimeInterval kHandDwellSeconds = 0.26;
+    constexpr float kParsecDist = 1.35f;
+    constexpr float kSideMonitorDist = 1.40f;
+    constexpr float kKeyboardDist = 0.68f;
+    constexpr float kKeyboardPitchDeg = -26.0f;
+    constexpr CFTimeInterval kHandDwellSeconds = 0.18;
+    constexpr CFTimeInterval kScreenDwellSeconds = 0.30;
+    constexpr int kHandJointCount = 21;
+    constexpr int kHandBoneCount = 20;
     constexpr const char *kKeychainSessionKey = "cardboardxr_native_parsec_session_v1";
+
+    constexpr int kHandBonePairs[kHandBoneCount][2] = {
+        {0, 1}, {1, 2}, {2, 3}, {3, 4},
+        {0, 5}, {5, 6}, {6, 7}, {7, 8},
+        {0, 9}, {9, 10}, {10, 11}, {11, 12},
+        {0, 13}, {13, 14}, {14, 15}, {15, 16},
+        {0, 17}, {17, 18}, {18, 19}, {19, 20},
+    };
+
+    NSArray<VNHumanHandPoseObservationJointName> *OrderedHandJointNames()
+    {
+        static NSArray<VNHumanHandPoseObservationJointName> *names = nil;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            names = @[
+                VNHumanHandPoseObservationJointNameWrist,
+                VNHumanHandPoseObservationJointNameThumbCMC,
+                VNHumanHandPoseObservationJointNameThumbMP,
+                VNHumanHandPoseObservationJointNameThumbIP,
+                VNHumanHandPoseObservationJointNameThumbTip,
+                VNHumanHandPoseObservationJointNameIndexMCP,
+                VNHumanHandPoseObservationJointNameIndexPIP,
+                VNHumanHandPoseObservationJointNameIndexDIP,
+                VNHumanHandPoseObservationJointNameIndexTip,
+                VNHumanHandPoseObservationJointNameMiddleMCP,
+                VNHumanHandPoseObservationJointNameMiddlePIP,
+                VNHumanHandPoseObservationJointNameMiddleDIP,
+                VNHumanHandPoseObservationJointNameMiddleTip,
+                VNHumanHandPoseObservationJointNameRingMCP,
+                VNHumanHandPoseObservationJointNameRingPIP,
+                VNHumanHandPoseObservationJointNameRingDIP,
+                VNHumanHandPoseObservationJointNameRingTip,
+                VNHumanHandPoseObservationJointNameLittleMCP,
+                VNHumanHandPoseObservationJointNameLittlePIP,
+                VNHumanHandPoseObservationJointNameLittleDIP,
+                VNHumanHandPoseObservationJointNameLittleTip,
+            ];
+        });
+        return names;
+    }
+
+    struct VRRayHit
+    {
+        SCNNode *node = nil;
+        CGPoint uv = CGPointZero;
+        float dist = 1e9f;
+        SCNVector3 worldPoint = SCNVector3Zero;
+    };
 
     enum class InputTarget
     {
@@ -160,6 +212,14 @@ namespace
 @property (nonatomic, strong) SCNNode *dockNode;
 @property (nonatomic, strong) SCNNode *keyboardNode;
 @property (nonatomic, strong) SCNNode *parsecCursorNode;
+@property (nonatomic, strong) SCNNode *cameraBgNode;
+@property (nonatomic, strong) SCNNode *hoverHighlightNode;
+@property (nonatomic, strong) SCNNode *handRayNode;
+@property (nonatomic, strong) SCNMaterial *indexTipMat;
+
+@property (nonatomic, strong) id<MTLDevice> mtlDevice;
+@property (nonatomic, strong) id<MTLCommandQueue> mtlQueue;
+@property (nonatomic, strong) id<MTLTexture> passthroughMtlTex;
 
 @property (nonatomic, strong) UIView *leftReticle;
 @property (nonatomic, strong) UIView *rightReticle;
@@ -218,7 +278,14 @@ namespace
 @property (nonatomic, assign) BOOL visionBusy;
 @property (nonatomic, assign) BOOL handTracked;
 @property (nonatomic, assign) BOOL pinchClosed;
+@property (nonatomic, assign) BOOL fingerPoking;
+@property (nonatomic, assign) BOOL fingerPokePending;
 @property (nonatomic, assign) CGPoint smoothedHandAim;
+@property (nonatomic, assign) int screenDwellPx;
+@property (nonatomic, assign) int screenDwellPy;
+@property (nonatomic, assign) CFTimeInterval screenDwellStartAt;
+@property (nonatomic, assign) BOOL screenDwellFired;
+@property (nonatomic, copy) NSString *screenDwellNodeName;
 @property (nonatomic, assign) BOOL parsecMouseHeld;
 @property (nonatomic, assign) int heldParsecButton;
 @property (nonatomic, assign) BOOL isTwoFingerScrolling;
@@ -235,6 +302,13 @@ namespace
     std::vector<VRButtonHit> _dockHits;
     std::vector<VRButtonHit> _keyboardHits;
     SideMonitorSlot _sideSlots[kMaxWebMonitors];
+    SCNNode *_handJointNodes[kHandJointCount];
+    SCNNode *_handBoneNodes[kHandBoneCount];
+    SCNVector3 _targetHandJoints[kHandJointCount];
+    SCNVector3 _currentHandJoints[kHandJointCount];
+    float _targetHandDepth;
+    float _restingHandDepth;
+    CGColorSpaceRef _rgbColorSpace;
 }
 
 - (BOOL)prefersStatusBarHidden { return YES; }
@@ -257,7 +331,8 @@ namespace
     self.activeSideSlot = 0;
     self.screenSizePreset = 1; // Default to Giant monitors.
     self.movingMonitorIndex = -2;
-    self.passthroughOn = NO; // Off by default for zero camera readback lag.
+    self.passthroughOn = YES; // GPU Metal passthrough active at startup so user sees their room.
+    self.handAimEnabled = YES; // Visible 3D hand + fingertip poke/dwell enabled at startup.
     self.singleScreenTouchMode = NO;
     self.keyboardVisible = YES;
     self.hosts = @[];
@@ -267,7 +342,24 @@ namespace
     self.lastMousePx = -1;
     self.lastMousePy = -1;
 
-    self.ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
+    _rgbColorSpace = CGColorSpaceCreateDeviceRGB();
+    self.mtlDevice = MTLCreateSystemDefaultDevice();
+    self.mtlQueue = [self.mtlDevice newCommandQueue];
+    if (self.mtlDevice)
+    {
+        self.ciContext = [CIContext contextWithMTLDevice:self.mtlDevice options:@{kCIContextWorkingColorSpace: [NSNull null]}];
+        MTLTextureDescriptor *ptDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+                                                                                          width:640
+                                                                                         height:360
+                                                                                      mipmapped:NO];
+        ptDesc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        ptDesc.storageMode = MTLStorageModePrivate;
+        self.passthroughMtlTex = [self.mtlDevice newTextureWithDescriptor:ptDesc];
+    }
+    else
+    {
+        self.ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
+    }
     self.visionQueue = dispatch_queue_create("com.brenpoly.cardboardxr.vision", DISPATCH_QUEUE_SERIAL);
     self.passthroughQueue = dispatch_queue_create("com.brenpoly.cardboardxr.passthrough", DISPATCH_QUEUE_SERIAL);
 
@@ -330,6 +422,11 @@ namespace
     [self.arSession pause];
     VRParsecDisconnect();
     VRWebDestroyAll();
+    if (_rgbColorSpace)
+    {
+        CGColorSpaceRelease(_rgbColorSpace);
+        _rgbColorSpace = nullptr;
+    }
 }
 
 - (void)setupSceneAndStereoViews
@@ -393,10 +490,18 @@ namespace
     return node;
 }
 
+- (UIGraphicsImageRenderer *)makeUiRendererWithSize:(CGSize)sz
+{
+    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat preferredFormat];
+    fmt.scale = 1.0;
+    fmt.opaque = NO;
+    return [[UIGraphicsImageRenderer alloc] initWithSize:sz format:fmt];
+}
+
 - (UIImage *)createFloorGridImage
 {
     CGSize sz = CGSizeMake(256, 256);
-    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:sz];
+    UIGraphicsImageRenderer *r = [self makeUiRendererWithSize:sz];
     return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
         [ColorHex(0x0E1018) setFill];
         [ctx fillRect:CGRectMake(0, 0, 256, 256)];
@@ -410,6 +515,20 @@ namespace
 {
     self.workspaceRoot = [SCNNode node];
     [self.scene.rootNode addChildNode:self.workspaceRoot];
+
+    SCNPlane *bgPlane = [SCNPlane planeWithWidth:120.0 height:72.0];
+    SCNMaterial *bgMat = [SCNMaterial material];
+    bgMat.lightingModelName = SCNLightingModelConstant;
+    bgMat.diffuse.contents = self.passthroughMtlTex ?: ColorHex(0x141218);
+    bgMat.readsFromDepthBuffer = NO;
+    bgMat.writesToDepthBuffer = NO;
+    bgMat.doubleSided = YES;
+    bgPlane.materials = @[bgMat];
+    self.cameraBgNode = [SCNNode nodeWithGeometry:bgPlane];
+    self.cameraBgNode.position = SCNVector3Make(0, 0, -28.0f);
+    self.cameraBgNode.renderingOrder = -100;
+    self.cameraBgNode.hidden = !self.passthroughOn;
+    [self.headNode addChildNode:self.cameraBgNode];
 
     SCNPlane *floorGeo = [SCNPlane planeWithWidth:16.0 height:16.0];
     SCNMaterial *floorMat = [SCNMaterial material];
@@ -426,27 +545,40 @@ namespace
     [self.workspaceRoot addChildNode:self.floorNode];
 
     self.mainAnchorNode = [SCNNode node];
-    self.mainAnchorNode.position = SCNVector3Make(0, 0.14f, -kParsecDist);
+    self.mainAnchorNode.position = SCNVector3Make(0, 0.36f, -kParsecDist);
+    self.mainAnchorNode.eulerAngles = SCNVector3Make(4.0f * M_PI / 180.0f, 0, 0);
     [self.workspaceRoot addChildNode:self.mainAnchorNode];
 
-    self.parsecScreenNode = [self makePlaneNode:@"parsec_screen" width:2.40 height:1.35 color:ColorHex(0x18171D)];
+    self.parsecScreenNode = [self makePlaneNode:@"parsec_screen" width:2.20 height:1.24 color:ColorHex(0x18171D)];
     [self.mainAnchorNode addChildNode:self.parsecScreenNode];
 
-    self.parsecPanelNode = [self makePlaneNode:@"parsec_panel" width:1.88 height:1.24 color:ColorHex(0x211F26)];
+    self.parsecPanelNode = [self makePlaneNode:@"parsec_panel" width:1.28 height:0.84 color:ColorHex(0x211F26)];
     [self.mainAnchorNode addChildNode:self.parsecPanelNode];
 
-    self.parsecBarNode = [self makePlaneNode:@"parsec_bar" width:2.10 height:0.22 color:ColorHex(0x211F26)];
-    self.parsecBarNode.position = SCNVector3Make(0, 0.80f, 0.01f);
+    self.parsecBarNode = [self makePlaneNode:@"parsec_bar" width:1.60 height:0.16 color:ColorHex(0x211F26)];
+    self.parsecBarNode.position = SCNVector3Make(0, 0.72f, 0.01f);
     [self.mainAnchorNode addChildNode:self.parsecBarNode];
 
-    self.dockNode = [self makePlaneNode:@"dock" width:1.96 height:0.28 color:ColorHex(0x211F26)];
-    self.dockNode.position = SCNVector3Make(0, -0.96f, -1.12f);
-    [self.workspaceRoot addChildNode:self.dockNode];
-
-    self.keyboardNode = [self makePlaneNode:@"keyboard" width:1.58 height:0.68 color:ColorHex(0x211F26)];
-    self.keyboardNode.position = SCNVector3Make(0, -0.44f, -kKeyboardDist);
+    self.keyboardNode = [self makePlaneNode:@"keyboard" width:0.84 height:0.35 color:ColorHex(0x211F26)];
+    self.keyboardNode.position = SCNVector3Make(0, -0.42f, -kKeyboardDist);
     self.keyboardNode.eulerAngles = SCNVector3Make(kKeyboardPitchDeg * M_PI / 180.0f, 0, 0);
     [self.workspaceRoot addChildNode:self.keyboardNode];
+
+    self.dockNode = [self makePlaneNode:@"dock" width:1.20 height:0.18 color:ColorHex(0x211F26)];
+    self.dockNode.position = SCNVector3Make(0, -0.76f, -0.64f);
+    self.dockNode.eulerAngles = SCNVector3Make(-34.0f * M_PI / 180.0f, 0, 0);
+    [self.workspaceRoot addChildNode:self.dockNode];
+
+    SCNPlane *hoverPlane = [SCNPlane planeWithWidth:1.0 height:1.0];
+    hoverPlane.cornerRadius = 0.08;
+    SCNMaterial *hoverMat = [SCNMaterial material];
+    hoverMat.lightingModelName = SCNLightingModelConstant;
+    hoverMat.diffuse.contents = ColorHex(0xD0BCFF, 0.28);
+    hoverMat.writesToDepthBuffer = NO;
+    hoverPlane.materials = @[hoverMat];
+    self.hoverHighlightNode = [SCNNode nodeWithGeometry:hoverPlane];
+    self.hoverHighlightNode.renderingOrder = 10;
+    self.hoverHighlightNode.hidden = YES;
 
     SCNSphere *cGeo = [SCNSphere sphereWithRadius:0.014];
     SCNMaterial *cMat = [SCNMaterial material];
@@ -459,11 +591,11 @@ namespace
 
     struct SlotDefaults { float yawDeg; float pitchDeg; float dist; BOOL startOn; const char *url; };
     const SlotDefaults defs[kMaxWebMonitors] = {
-        {-58.0f,  0.0f, 1.46f, NO, "https://www.youtube.com"},
-        { 58.0f,  0.0f, 1.46f, NO, "https://duckduckgo.com"},
-        {  0.0f, 34.0f, 1.50f, NO, "https://discord.com/app"},
-        {-104.0f, 0.0f, 1.46f, NO, "https://chatgpt.com"},
-        { 104.0f, 0.0f, 1.46f, NO, "https://github.com"},
+        {-54.0f,  4.0f, 1.40f, NO, "https://www.youtube.com"},
+        { 54.0f,  4.0f, 1.40f, NO, "https://duckduckgo.com"},
+        {  0.0f, 34.0f, 1.44f, NO, "https://discord.com/app"},
+        {-96.0f,  4.0f, 1.40f, NO, "https://chatgpt.com"},
+        { 96.0f,  4.0f, 1.40f, NO, "https://github.com"},
     };
 
     for (int i = 0; i < kMaxWebMonitors; ++i)
@@ -481,12 +613,12 @@ namespace
         [self.workspaceRoot addChildNode:slot.anchorNode];
 
         slot.screenNode = [self makePlaneNode:[NSString stringWithFormat:@"side_screen_%d", i]
-                                        width:1.92 height:1.15 color:ColorHex(0x18171D)];
+                                        width:1.80 height:1.08 color:ColorHex(0x18171D)];
         [slot.anchorNode addChildNode:slot.screenNode];
 
         slot.barNode = [self makePlaneNode:[NSString stringWithFormat:@"side_bar_%d", i]
-                                     width:1.92 height:0.28 color:ColorHex(0x211F26)];
-        slot.barNode.position = SCNVector3Make(0, 0.73f, 0.01f);
+                                     width:1.80 height:0.24 color:ColorHex(0x211F26)];
+        slot.barNode.position = SCNVector3Make(0, 0.68f, 0.01f);
         [slot.anchorNode addChildNode:slot.barNode];
 
         slot.cursorNode = [SCNNode nodeWithGeometry:cGeo];
@@ -495,6 +627,55 @@ namespace
 
         [self resetSideSlotPose:i];
     }
+
+    SCNSphere *jointGeo = [SCNSphere sphereWithRadius:0.0065];
+    SCNMaterial *jointMat = [SCNMaterial material];
+    jointMat.lightingModelName = SCNLightingModelConstant;
+    jointMat.diffuse.contents = ColorHex(0xD0BCFF, 0.92);
+    jointGeo.materials = @[jointMat];
+
+    SCNSphere *tipGeo = [SCNSphere sphereWithRadius:0.011];
+    self.indexTipMat = [SCNMaterial material];
+    self.indexTipMat.lightingModelName = SCNLightingModelConstant;
+    self.indexTipMat.diffuse.contents = ColorHex(0x5EEAD4, 0.96);
+    tipGeo.materials = @[self.indexTipMat];
+
+    for (int i = 0; i < kHandJointCount; ++i)
+    {
+        SCNNode *jn = [SCNNode nodeWithGeometry:(i == 8 ? tipGeo : jointGeo)];
+        jn.hidden = YES;
+        jn.renderingOrder = 25;
+        [self.headNode addChildNode:jn];
+        _handJointNodes[i] = jn;
+        _targetHandJoints[i] = SCNVector3Zero;
+        _currentHandJoints[i] = SCNVector3Zero;
+    }
+
+    SCNCylinder *boneGeo = [SCNCylinder cylinderWithRadius:0.0032 height:1.0];
+    SCNMaterial *boneMat = [SCNMaterial material];
+    boneMat.lightingModelName = SCNLightingModelConstant;
+    boneMat.diffuse.contents = ColorHex(0xE8DEF8, 0.78);
+    boneGeo.materials = @[boneMat];
+
+    for (int b = 0; b < kHandBoneCount; ++b)
+    {
+        SCNNode *bn = [SCNNode nodeWithGeometry:boneGeo];
+        bn.hidden = YES;
+        bn.renderingOrder = 24;
+        [self.headNode addChildNode:bn];
+        _handBoneNodes[b] = bn;
+    }
+
+    SCNCylinder *rayGeo = [SCNCylinder cylinderWithRadius:0.0022 height:1.0];
+    SCNMaterial *rayMat = [SCNMaterial material];
+    rayMat.lightingModelName = SCNLightingModelConstant;
+    rayMat.diffuse.contents = ColorHex(0x5EEAD4, 0.55);
+    rayMat.writesToDepthBuffer = NO;
+    rayGeo.materials = @[rayMat];
+    self.handRayNode = [SCNNode nodeWithGeometry:rayGeo];
+    self.handRayNode.hidden = YES;
+    self.handRayNode.renderingOrder = 23;
+    [self.headNode addChildNode:self.handRayNode];
 }
 
 - (void)resetSideSlotPose:(int)i
@@ -505,7 +686,7 @@ namespace
     float pitch = slot.defaultPitchDeg * M_PI / 180.0f;
     float cosP = cosf(pitch);
     float x = -sinf(yaw) * cosP * slot.defaultDist;
-    float y = 0.14f + sinf(pitch) * slot.defaultDist;
+    float y = 0.36f + sinf(pitch) * slot.defaultDist;
     float z = -cosf(yaw) * cosP * slot.defaultDist;
     slot.anchorNode.position = SCNVector3Make(x, y, z);
     slot.anchorNode.eulerAngles = SCNVector3Make(-pitch, yaw, 0);
@@ -513,9 +694,9 @@ namespace
 
 - (float)currentMonitorScale
 {
-    if (self.screenSizePreset == 0) return 1.15f;
-    if (self.screenSizePreset == 1) return 1.50f;
-    return 1.90f;
+    if (self.screenSizePreset == 0) return 1.05f;
+    if (self.screenSizePreset == 1) return 1.30f;
+    return 1.60f;
 }
 
 - (void)applyMonitorSizes
@@ -607,18 +788,17 @@ namespace
     CFTimeInterval now = CACurrentMediaTime();
     if (self.passthroughOn && !self.passthroughBusy && now >= self.nextPassthroughAt)
     {
-        self.nextPassthroughAt = now + (1.0 / 15.0);
+        self.nextPassthroughAt = now + (1.0 / 30.0);
         self.passthroughBusy = YES;
         CVPixelBufferRef pb = CVPixelBufferRetain(frame.capturedImage);
         dispatch_async(self.passthroughQueue, ^{
             [self updatePassthroughBackground:pb orientation:orient];
-            CVPixelBufferRelease(pb);
         });
     }
 
     if (self.handAimEnabled && !self.visionBusy && now >= self.nextVisionAt)
     {
-        self.nextVisionAt = now + (1.0 / 12.0);
+        self.nextVisionAt = now + (1.0 / 20.0);
         self.visionBusy = YES;
         CVPixelBufferRef pb = CVPixelBufferRetain(frame.capturedImage);
         CGImagePropertyOrientation cgOrient = (orient == UIInterfaceOrientationLandscapeLeft)
@@ -634,9 +814,11 @@ namespace
 
 - (void)updatePassthroughBackground:(CVPixelBufferRef)pixelBuffer orientation:(UIInterfaceOrientation)orient
 {
-    if (!pixelBuffer)
+    if (!pixelBuffer || !self.mtlQueue || !self.passthroughMtlTex)
     {
-        dispatch_async(dispatch_get_main_queue(), ^{ self.passthroughBusy = NO; });
+        if (pixelBuffer)
+            CVPixelBufferRelease(pixelBuffer);
+        self.passthroughBusy = NO;
         return;
     }
 
@@ -645,23 +827,44 @@ namespace
         ? kCGImagePropertyOrientationDown
         : kCGImagePropertyOrientationUp;
     ci = [ci imageByApplyingOrientation:cgOrient];
-    ci = [ci imageByApplyingTransform:CGAffineTransformMakeScale(0.35, 0.35)];
-    CGRect extent = ci.extent;
-    UIImage *bg = nil;
-    if (extent.size.width > 0 && extent.size.height > 0)
+    CGRect e0 = ci.extent;
+    if (e0.size.width <= 0 || e0.size.height <= 0)
     {
-        CGImageRef cg = [self.ciContext createCGImage:ci fromRect:extent];
-        if (cg)
-        {
-            bg = [UIImage imageWithCGImage:cg];
-            CGImageRelease(cg);
-        }
-    }
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (bg && self.passthroughOn)
-            self.scene.background.contents = bg;
+        CVPixelBufferRelease(pixelBuffer);
         self.passthroughBusy = NO;
-    });
+        return;
+    }
+    ci = [ci imageByApplyingTransform:CGAffineTransformMakeTranslation(-e0.origin.x, -e0.origin.y)];
+    CGFloat sx = 640.0 / e0.size.width;
+    CGFloat sy = 360.0 / e0.size.height;
+    ci = [ci imageByApplyingTransform:CGAffineTransformMakeScale(sx, sy)];
+
+    id<MTLCommandBuffer> cmdBuf = [self.mtlQueue commandBuffer];
+    if (!cmdBuf)
+    {
+        CVPixelBufferRelease(pixelBuffer);
+        self.passthroughBusy = NO;
+        return;
+    }
+
+    CIRenderDestination *dest = [[CIRenderDestination alloc] initWithMTLTexture:self.passthroughMtlTex commandBuffer:cmdBuf];
+    dest.flipped = YES;
+    dest.colorSpace = _rgbColorSpace;
+    NSError *err = nil;
+    [self.ciContext startTaskToRender:ci toDestination:dest error:&err];
+    if (err)
+    {
+        CVPixelBufferRelease(pixelBuffer);
+        self.passthroughBusy = NO;
+        return;
+    }
+
+    [cmdBuf addCompletedHandler:^(id<MTLCommandBuffer> _Nonnull cb) {
+        (void)cb;
+        CVPixelBufferRelease(pixelBuffer);
+        self.passthroughBusy = NO;
+    }];
+    [cmdBuf commit];
 }
 
 - (void)processHandPoseOnBuffer:(CVPixelBufferRef)pixelBuffer orientation:(CGImagePropertyOrientation)orient
@@ -675,14 +878,57 @@ namespace
 
     BOOL tracked = NO;
     CGPoint aimNorm = CGPointMake(0.5, 0.5);
+    float estDepth = 0.45f;
+    std::vector<SCNVector3> parsedJoints(kHandJointCount, SCNVector3Zero);
 
     if (obs)
     {
-        VNRecognizedPoint *idx = [obs recognizedPointForJointName:VNHumanHandPoseObservationJointNameIndexTip error:nil];
-        if (idx && idx.confidence > 0.35f)
+        NSArray<VNHumanHandPoseObservationJointName> *names = OrderedHandJointNames();
+        float ptX[kHandJointCount] = {};
+        float ptY[kHandJointCount] = {};
+        BOOL valid[kHandJointCount] = {};
+
+        for (int i = 0; i < kHandJointCount; ++i)
+        {
+            VNRecognizedPoint *jp = [obs recognizedPointForJointName:names[i] error:nil];
+            if (jp && jp.confidence > 0.25f)
+            {
+                ptX[i] = static_cast<float>(jp.location.x);
+                ptY[i] = static_cast<float>(jp.location.y);
+                valid[i] = YES;
+            }
+        }
+
+        if (valid[0] && valid[8])
         {
             tracked = YES;
-            aimNorm = idx.location;
+            aimNorm = CGPointMake(ptX[8], ptY[8]);
+            for (int i = 1; i < kHandJointCount; ++i)
+            {
+                if (!valid[i])
+                {
+                    int fallback = (i <= 4 || i == 5 || i == 9 || i == 13 || i == 17) ? 0 : (i - 1);
+                    ptX[i] = valid[fallback] ? ptX[fallback] : ptX[0];
+                    ptY[i] = valid[fallback] ? ptY[fallback] : ptY[0];
+                }
+            }
+
+            float p9x = valid[9] ? ptX[9] : ptX[5];
+            float p9y = valid[9] ? ptY[9] : ptY[5];
+            float palmSpan = hypotf((p9x - ptX[0]) * 1.55f, (p9y - ptY[0]));
+            float knuckSpan = (valid[5] && valid[17]) ? hypotf((ptX[17] - ptX[5]) * 1.55f, (ptY[17] - ptY[5])) : palmSpan;
+            float palmNorm = std::max(0.045f, std::max(palmSpan, knuckSpan));
+            estDepth = std::max(0.22f, std::min(0.75f, 0.105f / palmNorm));
+
+            for (int i = 0; i < kHandJointCount; ++i)
+            {
+                float nx = (ptX[i] - 0.5f) * 2.0f;
+                float ny = (ptY[i] - 0.5f) * 2.0f;
+                float zJ = estDepth;
+                if (i >= 5 && i <= 8)
+                    zJ -= 0.008f * static_cast<float>(i - 5);
+                parsedJoints[i] = SCNVector3Make(nx * 0.68f * zJ, ny * 0.42f * zJ, -zJ);
+            }
         }
     }
 
@@ -692,9 +938,149 @@ namespace
         {
             self.smoothedHandAim = CGPointMake(self.smoothedHandAim.x * 0.55 + aimNorm.x * 0.45,
                                                self.smoothedHandAim.y * 0.55 + aimNorm.y * 0.45);
+            for (int i = 0; i < kHandJointCount; ++i)
+                _targetHandJoints[i] = parsedJoints[i];
+            _targetHandDepth = estDepth;
+
+            if (_restingHandDepth <= 0.01f)
+                _restingHandDepth = estDepth;
+
+            BOOL nearKeyboard = NO;
+            if (self.keyboardVisible)
+            {
+                SCNVector3 tipLocal = _targetHandJoints[8];
+                simd_float4 tipWorld = simd_mul(self.headNode.simdWorldTransform,
+                                                simd_make_float4(tipLocal.x, tipLocal.y, tipLocal.z, 1.0f));
+                simd_float4 kbPt = simd_mul(simd_inverse(self.keyboardNode.simdWorldTransform), tipWorld);
+                SCNPlane *kbGeo = (SCNPlane *)self.keyboardNode.geometry;
+                if (fabsf(kbPt.z) <= 0.055f &&
+                    fabsf(kbPt.x) <= kbGeo.width * 0.52f &&
+                    fabsf(kbPt.y) <= kbGeo.height * 0.52f)
+                {
+                    nearKeyboard = YES;
+                }
+            }
+
+            float pokeThresh = self.fingerPoking ? 0.016f : 0.025f;
+            BOOL pokeNow = ((_restingHandDepth - estDepth) >= pokeThresh) || nearKeyboard;
+            if (!pokeNow)
+                _restingHandDepth = _restingHandDepth * 0.90f + estDepth * 0.10f;
+
+            if (pokeNow && !self.fingerPoking)
+            {
+                self.fingerPoking = YES;
+                self.fingerPokePending = YES;
+            }
+            else if (!pokeNow && self.fingerPoking)
+            {
+                self.fingerPoking = NO;
+                [self handlePrimaryActionUp];
+            }
+        }
+        else
+        {
+            _restingHandDepth = 0.0f;
+            if (self.fingerPoking)
+            {
+                self.fingerPoking = NO;
+                [self handlePrimaryActionUp];
+            }
         }
         self.visionBusy = NO;
     });
+}
+
+- (void)hideHandSkeleton
+{
+    for (int i = 0; i < kHandJointCount; ++i)
+        _handJointNodes[i].hidden = YES;
+    for (int b = 0; b < kHandBoneCount; ++b)
+        _handBoneNodes[b].hidden = YES;
+    self.handRayNode.hidden = YES;
+}
+
+- (void)updateHandSkeletonWithHitDist:(float)hitDist hasHit:(BOOL)hasHit
+{
+    if (!self.handAimEnabled || !self.handTracked)
+    {
+        [self hideHandSkeleton];
+        return;
+    }
+
+    float alpha = 0.42f;
+    for (int i = 0; i < kHandJointCount; ++i)
+    {
+        SCNVector3 cur = _currentHandJoints[i];
+        SCNVector3 tgt = _targetHandJoints[i];
+        SCNVector3 next = SCNVector3Make(cur.x + (tgt.x - cur.x) * alpha,
+                                         cur.y + (tgt.y - cur.y) * alpha,
+                                         cur.z + (tgt.z - cur.z) * alpha);
+        _currentHandJoints[i] = next;
+        _handJointNodes[i].position = next;
+        _handJointNodes[i].hidden = NO;
+    }
+
+    self.indexTipMat.diffuse.contents = (self.fingerPoking || self.parsecMouseHeld)
+        ? ColorHex(0x4ADE80, 0.98)
+        : ColorHex(0x5EEAD4, 0.96);
+
+    const simd_float3 up = simd_make_float3(0.0f, 1.0f, 0.0f);
+    for (int b = 0; b < kHandBoneCount; ++b)
+    {
+        SCNVector3 pA = _currentHandJoints[kHandBonePairs[b][0]];
+        SCNVector3 pB = _currentHandJoints[kHandBonePairs[b][1]];
+        float dx = pB.x - pA.x;
+        float dy = pB.y - pA.y;
+        float dz = pB.z - pA.z;
+        float len = sqrtf(dx * dx + dy * dy + dz * dz);
+        SCNNode *bone = _handBoneNodes[b];
+        if (len < 1e-4f)
+        {
+            bone.hidden = YES;
+            continue;
+        }
+        bone.hidden = NO;
+        bone.position = SCNVector3Make((pA.x + pB.x) * 0.5f, (pA.y + pB.y) * 0.5f, (pA.z + pB.z) * 0.5f);
+        bone.scale = SCNVector3Make(1.0f, len, 1.0f);
+        simd_float3 dir = simd_make_float3(dx / len, dy / len, dz / len);
+        float d = simd_dot(up, dir);
+        if (d < -0.9995f)
+            bone.simdOrientation = simd_quaternion(static_cast<float>(M_PI), simd_make_float3(1.0f, 0.0f, 0.0f));
+        else
+            bone.simdOrientation = simd_quaternion(up, dir);
+    }
+
+    if (hasHit)
+    {
+        SCNVector3 tip = _currentHandJoints[8];
+        float rx = tip.x;
+        float ry = tip.y + 0.05f;
+        float rz = tip.z;
+        float rlen = sqrtf(rx * rx + ry * ry + rz * rz);
+        if (rlen > 1e-4f)
+        {
+            simd_float3 rdir = simd_make_float3(rx / rlen, ry / rlen, rz / rlen);
+            float rayLen = std::max(0.08f, std::min(2.5f, hitDist - rlen));
+            self.handRayNode.hidden = NO;
+            self.handRayNode.position = SCNVector3Make(tip.x + rdir.x * rayLen * 0.5f,
+                                                       tip.y + rdir.y * rayLen * 0.5f,
+                                                       tip.z + rdir.z * rayLen * 0.5f);
+            self.handRayNode.scale = SCNVector3Make(1.0f, rayLen, 1.0f);
+            float d = simd_dot(up, rdir);
+            if (d < -0.9995f)
+                self.handRayNode.simdOrientation = simd_quaternion(static_cast<float>(M_PI), simd_make_float3(1.0f, 0.0f, 0.0f));
+            else
+                self.handRayNode.simdOrientation = simd_quaternion(up, rdir);
+        }
+        else
+        {
+            self.handRayNode.hidden = YES;
+        }
+    }
+    else
+    {
+        self.handRayNode.hidden = YES;
+    }
 }
 
 - (void)onTick:(CADisplayLink *)link
@@ -715,7 +1101,7 @@ namespace
 
     UIColor *reticleColor = (self.movingMonitorIndex >= -1)
         ? ColorHex(0x80E5A3)
-        : (self.handTracked ? ColorHex(0xD0BCFF) : [UIColor whiteColor]);
+        : (self.handTracked ? ColorHex(0x5EEAD4) : [UIColor whiteColor]);
     self.leftReticle.layer.borderColor = reticleColor.CGColor;
     self.rightReticle.layer.borderColor = reticleColor.CGColor;
     CGFloat scale = (self.hoveredButtonId != nil || self.movingMonitorIndex >= -1) ? 1.45 : 1.0;
@@ -723,89 +1109,146 @@ namespace
     self.rightReticle.transform = CGAffineTransformMakeScale(scale, scale);
 }
 
-- (SCNHitTestResult *)firstInteractiveHitFromResults:(NSArray<SCNHitTestResult *> *)hits
+- (BOOL)isCandidateVisible:(SCNNode *)node
 {
-    for (SCNHitTestResult *res in hits)
+    if (!node || node.hidden || !node.geometry)
+        return NO;
+    for (SCNNode *p = node.parentNode; p != nil; p = p.parentNode)
     {
-        if (res.node == self.floorNode || res.node == self.parsecCursorNode)
-            continue;
-        BOOL isCursor = NO;
-        for (int i = 0; i < kMaxWebMonitors; ++i)
-        {
-            if (res.node == _sideSlots[i].cursorNode) { isCursor = YES; break; }
-        }
-        if (isCursor)
-            continue;
-        if (!res.node.hidden && res.node.name.length > 0)
-            return res;
+        if (p.hidden)
+            return NO;
     }
-    return nil;
+    return YES;
 }
 
-- (SCNHitTestResult *)raycastTouchPoint:(CGPoint)ptInView
+- (void)testPlaneNode:(SCNNode *)node
+            rayOrigin:(simd_float3)origin
+               rayDir:(simd_float3)dir
+              bestHit:(VRRayHit &)best
+{
+    if (![self isCandidateVisible:node])
+        return;
+
+    simd_float4x4 wt = node.simdWorldTransform;
+    simd_float4x4 inv = simd_inverse(wt);
+    simd_float4 lo = simd_mul(inv, simd_make_float4(origin.x, origin.y, origin.z, 1.0f));
+    simd_float4 ld = simd_mul(inv, simd_make_float4(dir.x, dir.y, dir.z, 0.0f));
+    if (fabsf(ld.z) < 1e-5f)
+        return;
+
+    float t = -lo.z / ld.z;
+    if (t <= 0.02f || t > 14.0f)
+        return;
+
+    float hx = lo.x + t * ld.x;
+    float hy = lo.y + t * ld.y;
+    SCNPlane *pl = (SCNPlane *)node.geometry;
+    float halfW = static_cast<float>(pl.width * 0.5);
+    float halfH = static_cast<float>(pl.height * 0.5);
+    if (fabsf(hx) > halfW || fabsf(hy) > halfH)
+        return;
+
+    simd_float4 hw = simd_mul(wt, simd_make_float4(hx, hy, 0.0f, 1.0f));
+    float dx = hw.x - origin.x;
+    float dy = hw.y - origin.y;
+    float dz = hw.z - origin.z;
+    float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (dist < best.dist)
+    {
+        float u = std::max(0.0f, std::min(1.0f, hx / std::max(1e-4f, static_cast<float>(pl.width)) + 0.5f));
+        float v = std::max(0.0f, std::min(1.0f, 0.5f - hy / std::max(1e-4f, static_cast<float>(pl.height))));
+        best.node = node;
+        best.uv = CGPointMake(u, v);
+        best.dist = dist;
+        best.worldPoint = SCNVector3Make(hw.x, hw.y, hw.z);
+    }
+}
+
+- (VRRayHit)analyticRaycastOrigin:(SCNVector3)origin dir:(SCNVector3)dir
+{
+    VRRayHit best;
+    simd_float3 o = simd_make_float3(origin.x, origin.y, origin.z);
+    simd_float3 d = simd_make_float3(dir.x, dir.y, dir.z);
+
+    [self testPlaneNode:self.keyboardNode rayOrigin:o rayDir:d bestHit:best];
+    [self testPlaneNode:self.dockNode rayOrigin:o rayDir:d bestHit:best];
+    [self testPlaneNode:self.parsecBarNode rayOrigin:o rayDir:d bestHit:best];
+    [self testPlaneNode:self.parsecPanelNode rayOrigin:o rayDir:d bestHit:best];
+    [self testPlaneNode:self.parsecScreenNode rayOrigin:o rayDir:d bestHit:best];
+    for (int i = 0; i < kMaxWebMonitors; ++i)
+    {
+        [self testPlaneNode:_sideSlots[i].barNode rayOrigin:o rayDir:d bestHit:best];
+        [self testPlaneNode:_sideSlots[i].screenNode rayOrigin:o rayDir:d bestHit:best];
+    }
+    return best;
+}
+
+- (VRRayHit)raycastTouchPoint:(CGPoint)ptInView
 {
     SCNView *targetView = (self.singleScreenTouchMode || ptInView.x <= self.view.bounds.size.width * 0.5)
         ? self.leftView
         : self.rightView;
     CGPoint localPt = [targetView convertPoint:ptInView fromView:self.view];
-    NSArray<SCNHitTestResult *> *hits = [targetView hitTest:localPt options:@{
-        SCNHitTestSortResultsKey: @YES,
-        SCNHitTestBackFaceCullingKey: @NO
-    }];
-    return [self firstInteractiveHitFromResults:hits];
+    SCNVector3 pNear = [targetView unprojectPoint:SCNVector3Make(localPt.x, localPt.y, 0.0f)];
+    SCNVector3 pFar = [targetView unprojectPoint:SCNVector3Make(localPt.x, localPt.y, 1.0f)];
+    float dx = pFar.x - pNear.x;
+    float dy = pFar.y - pNear.y;
+    float dz = pFar.z - pNear.z;
+    float len = sqrtf(dx * dx + dy * dy + dz * dz);
+    if (len < 1e-5f)
+        return VRRayHit{};
+    SCNVector3 dir = SCNVector3Make(dx / len, dy / len, dz / len);
+    return [self analyticRaycastOrigin:pNear dir:dir];
 }
 
-- (SCNHitTestResult *)raycastCenterGaze:(SCNVector3 *)outOrigin dir:(SCNVector3 *)outDir
+- (VRRayHit)raycastCenterGaze:(SCNVector3 *)outOrigin dir:(SCNVector3 *)outDir
 {
-    SCNMatrix4 m = self.headNode.worldTransform;
-    SCNVector3 origin = SCNVector3Make(m.m41, m.m42, m.m43);
-    float dx = self.handAimEnabled && self.handTracked ? static_cast<float>((self.smoothedHandAim.x - 0.5) * 0.45) : 0.0f;
-    float dy = self.handAimEnabled && self.handTracked ? static_cast<float>((self.smoothedHandAim.y - 0.5) * 0.35) : 0.0f;
-    SCNVector3 localDir = SCNVector3Make(dx, dy, -1.0f);
-    SCNVector3 worldDir = SCNVector3Make(
-        m.m11 * localDir.x + m.m21 * localDir.y + m.m31 * localDir.z,
-        m.m12 * localDir.x + m.m22 * localDir.y + m.m32 * localDir.z,
-        m.m13 * localDir.x + m.m23 * localDir.y + m.m33 * localDir.z);
-    float len = sqrtf(worldDir.x * worldDir.x + worldDir.y * worldDir.y + worldDir.z * worldDir.z);
-    if (len > 1e-5f)
+    simd_float4x4 hm = self.headNode.simdWorldTransform;
+    SCNVector3 localOrigin = SCNVector3Zero;
+    SCNVector3 localDir = SCNVector3Make(0, 0, -1.0f);
+    if (self.handAimEnabled && self.handTracked)
     {
-        worldDir.x /= len;
-        worldDir.y /= len;
-        worldDir.z /= len;
+        SCNVector3 tip = _currentHandJoints[8];
+        localOrigin = SCNVector3Make(0.0f, -0.05f, 0.0f);
+        float dx = tip.x - localOrigin.x;
+        float dy = tip.y - localOrigin.y;
+        float dz = tip.z - localOrigin.z;
+        float len = sqrtf(dx * dx + dy * dy + dz * dz);
+        if (len > 1e-4f)
+            localDir = SCNVector3Make(dx / len, dy / len, dz / len);
     }
+
+    simd_float4 wo = simd_mul(hm, simd_make_float4(localOrigin.x, localOrigin.y, localOrigin.z, 1.0f));
+    simd_float4 wd = simd_mul(hm, simd_make_float4(localDir.x, localDir.y, localDir.z, 0.0f));
+    float wlen = sqrtf(wd.x * wd.x + wd.y * wd.y + wd.z * wd.z);
+    if (wlen > 1e-5f)
+    {
+        wd.x /= wlen;
+        wd.y /= wlen;
+        wd.z /= wlen;
+    }
+
+    SCNVector3 origin = SCNVector3Make(wo.x, wo.y, wo.z);
+    SCNVector3 dir = SCNVector3Make(wd.x, wd.y, wd.z);
     if (outOrigin) *outOrigin = origin;
-    if (outDir) *outDir = worldDir;
-
-    SCNVector3 end = SCNVector3Make(origin.x + worldDir.x * 14.0f,
-                                    origin.y + worldDir.y * 14.0f,
-                                    origin.z + worldDir.z * 14.0f);
-    NSArray<SCNHitTestResult *> *hits = [self.scene.rootNode hitTestWithSegmentFromPoint:origin toPoint:end options:@{
-        SCNHitTestSortResultsKey: @YES,
-        SCNHitTestBackFaceCullingKey: @NO
-    }];
-    return [self firstInteractiveHitFromResults:hits];
+    if (outDir) *outDir = dir;
+    return [self analyticRaycastOrigin:origin dir:dir];
 }
 
-- (CGPoint)topLeftUvForHit:(SCNHitTestResult *)hit
-{
-    SCNPlane *plane = (SCNPlane *)hit.node.geometry;
-    CGFloat w = plane.width > 0 ? plane.width : 1.0;
-    CGFloat h = plane.height > 0 ? plane.height : 1.0;
-    float u = static_cast<float>(hit.localCoordinates.x / w + 0.5);
-    float v = static_cast<float>(0.5 - hit.localCoordinates.y / h);
-    u = std::max(0.0f, std::min(1.0f, u));
-    v = std::max(0.0f, std::min(1.0f, v));
-    return CGPointMake(u, v);
-}
-
-- (NSString *)buttonAtUv:(CGPoint)uv inList:(const std::vector<VRButtonHit> &)list
+- (const VRButtonHit *)buttonHitAtUv:(CGPoint)uv inList:(const std::vector<VRButtonHit> &)list
 {
     for (const auto &b : list)
     {
         if (!b.disabled && CGRectContainsPoint(b.uvRect, uv))
-            return b.buttonId;
+            return &b;
     }
-    return nil;
+    return nullptr;
+}
+
+- (NSString *)buttonAtUv:(CGPoint)uv inList:(const std::vector<VRButtonHit> &)list
+{
+    const VRButtonHit *b = [self buttonHitAtUv:uv inList:list];
+    return b ? b->buttonId : nil;
 }
 
 - (int)sideSlotIndexForNode:(SCNNode *)node isBar:(BOOL *)outIsBar
@@ -818,22 +1261,74 @@ namespace
     return -1;
 }
 
+- (void)applyHoverOverlayToNode:(SCNNode *)panelNode buttonHit:(const VRButtonHit *)btnHit
+{
+    if (!panelNode || !btnHit)
+    {
+        self.hoverHighlightNode.hidden = YES;
+        return;
+    }
+    SCNPlane *pl = (SCNPlane *)panelNode.geometry;
+    CGRect uvr = btnHit->uvRect;
+    float uCenter = static_cast<float>(uvr.origin.x + uvr.size.width * 0.5);
+    float vCenter = static_cast<float>(uvr.origin.y + uvr.size.height * 0.5);
+    float bw = static_cast<float>(uvr.size.width * pl.width);
+    float bh = static_cast<float>(uvr.size.height * pl.height);
+    if (self.hoverHighlightNode.parentNode != panelNode)
+        [panelNode addChildNode:self.hoverHighlightNode];
+    self.hoverHighlightNode.position = SCNVector3Make((uCenter - 0.5f) * static_cast<float>(pl.width),
+                                                      (0.5f - vCenter) * static_cast<float>(pl.height),
+                                                      0.004f);
+    self.hoverHighlightNode.scale = SCNVector3Make(bw, bh, 1.0f);
+    self.hoverHighlightNode.hidden = NO;
+}
+
 - (void)updatePointerHoverAndCursor
 {
-    if (self.parsecMouseHeld)
-        return;
+    VRRayHit hit = [self raycastCenterGaze:nil dir:nil];
+    [self updateHandSkeletonWithHitDist:hit.dist hasHit:(hit.node != nil)];
 
-    SCNHitTestResult *hit = [self raycastCenterGaze:nil dir:nil];
-    NSString *newNode = hit ? hit.node.name : nil;
+    if (self.fingerPokePending)
+    {
+        self.fingerPokePending = NO;
+        [self handleRayHitDown:hit fromDirectTouch:NO];
+    }
+
+    if (self.parsecMouseHeld)
+    {
+        if (hit.node == self.parsecScreenNode && self.parsecConnected)
+        {
+            int maxW = std::max(1, self.hostWidth - 1);
+            int maxH = std::max(1, self.hostHeight - 1);
+            int px = static_cast<int>(hit.uv.x * maxW);
+            int py = static_cast<int>(hit.uv.y * maxH);
+            if (px != self.lastMousePx || py != self.lastMousePy)
+            {
+                self.lastMousePx = px;
+                self.lastMousePy = py;
+                VRParsecSendStreamMousePosition(0, px, py);
+            }
+            self.parsecCursorNode.hidden = NO;
+            SCNPlane *pl = (SCNPlane *)self.parsecScreenNode.geometry;
+            self.parsecCursorNode.position = SCNVector3Make((hit.uv.x - 0.5) * pl.width, (0.5 - hit.uv.y) * pl.height, 0.01f);
+        }
+        return;
+    }
+
+    NSString *newNode = hit.node ? hit.node.name : nil;
     NSString *newBtn = nil;
+    const VRButtonHit *btnHit = nullptr;
 
     self.parsecCursorNode.hidden = YES;
     for (int i = 0; i < kMaxWebMonitors; ++i)
         _sideSlots[i].cursorNode.hidden = YES;
 
-    if (hit)
+    CFTimeInterval now = CACurrentMediaTime();
+    BOOL onInteractiveScreen = NO;
+
+    if (hit.node)
     {
-        CGPoint uv = [self topLeftUvForHit:hit];
+        CGPoint uv = hit.uv;
         BOOL isSideBar = NO;
         int sideIdx = [self sideSlotIndexForNode:hit.node isBar:&isSideBar];
         int maxW = std::max(1, self.hostWidth - 1);
@@ -841,47 +1336,109 @@ namespace
 
         if (hit.node == self.parsecScreenNode && self.parsecConnected)
         {
+            onInteractiveScreen = YES;
             self.parsecCursorNode.hidden = NO;
             SCNPlane *pl = (SCNPlane *)self.parsecScreenNode.geometry;
             self.parsecCursorNode.position = SCNVector3Make((uv.x - 0.5) * pl.width, (0.5 - uv.y) * pl.height, 0.01f);
-            if (!self.singleScreenTouchMode)
+            int px = static_cast<int>(uv.x * maxW);
+            int py = static_cast<int>(uv.y * maxH);
+            if (!self.singleScreenTouchMode && (px != self.lastMousePx || py != self.lastMousePy))
             {
-                int px = static_cast<int>(uv.x * maxW);
-                int py = static_cast<int>(uv.y * maxH);
-                if (px != self.lastMousePx || py != self.lastMousePy)
+                self.lastMousePx = px;
+                self.lastMousePy = py;
+                VRParsecSendStreamMousePosition(0, px, py);
+            }
+            if (self.handAimEnabled && self.handTracked)
+            {
+                if (![self.screenDwellNodeName isEqualToString:@"parsec_screen"] ||
+                    abs(px - self.screenDwellPx) > 18 || abs(py - self.screenDwellPy) > 18)
                 {
-                    self.lastMousePx = px;
-                    self.lastMousePy = py;
-                    VRParsecSendStreamMousePosition(0, px, py);
+                    self.screenDwellNodeName = @"parsec_screen";
+                    self.screenDwellPx = px;
+                    self.screenDwellPy = py;
+                    self.screenDwellStartAt = now;
+                    self.screenDwellFired = NO;
+                }
+                else if (!self.screenDwellFired && (now - self.screenDwellStartAt) >= kScreenDwellSeconds)
+                {
+                    self.screenDwellFired = YES;
+                    AudioServicesPlaySystemSound(1104);
+                    int btn = self.rightClickArmed ? 3 : 1;
+                    VRParsecSendMouseButton(btn, 1);
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                        VRParsecSendMouseButton(btn, 0);
+                    });
+                    if (self.rightClickArmed)
+                    {
+                        self.rightClickArmed = NO;
+                        [self redrawDockPanel];
+                    }
                 }
             }
         }
         else if (sideIdx >= 0 && !isSideBar)
         {
+            onInteractiveScreen = YES;
             SideMonitorSlot &slot = _sideSlots[sideIdx];
             slot.cursorNode.hidden = NO;
             SCNPlane *pl = (SCNPlane *)slot.screenNode.geometry;
             slot.cursorNode.position = SCNVector3Make((uv.x - 0.5) * pl.width, (0.5 - uv.y) * pl.height, 0.01f);
+            int px = static_cast<int>(uv.x * maxW);
+            int py = static_cast<int>(uv.y * maxH);
             if (slot.useParsecStream2 && self.parsecConnected && !self.singleScreenTouchMode)
-            {
-                int px = static_cast<int>(uv.x * maxW);
-                int py = static_cast<int>(uv.y * maxH);
                 VRParsecSendStreamMousePosition(1, px, py);
+            if (self.handAimEnabled && self.handTracked)
+            {
+                NSString *sName = hit.node.name;
+                if (![self.screenDwellNodeName isEqualToString:sName] ||
+                    abs(px - self.screenDwellPx) > 18 || abs(py - self.screenDwellPy) > 18)
+                {
+                    self.screenDwellNodeName = sName;
+                    self.screenDwellPx = px;
+                    self.screenDwellPy = py;
+                    self.screenDwellStartAt = now;
+                    self.screenDwellFired = NO;
+                }
+                else if (!self.screenDwellFired && (now - self.screenDwellStartAt) >= kScreenDwellSeconds)
+                {
+                    self.screenDwellFired = YES;
+                    AudioServicesPlaySystemSound(1104);
+                    if (slot.useParsecStream2 && self.parsecConnected)
+                    {
+                        int btn = self.rightClickArmed ? 3 : 1;
+                        VRParsecSendMouseButton(btn, 1);
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                            VRParsecSendMouseButton(btn, 0);
+                        });
+                    }
+                    else
+                    {
+                        VRWebClickSlot(sideIdx, static_cast<float>(uv.x), static_cast<float>(uv.y));
+                    }
+                }
             }
         }
         else if (sideIdx >= 0 && isSideBar)
-            newBtn = [self buttonAtUv:uv inList:_sideSlots[sideIdx].barHits];
+            btnHit = [self buttonHitAtUv:uv inList:_sideSlots[sideIdx].barHits];
         else if (hit.node == self.parsecPanelNode)
-            newBtn = [self buttonAtUv:uv inList:_parsecPanelHits];
+            btnHit = [self buttonHitAtUv:uv inList:_parsecPanelHits];
         else if (hit.node == self.parsecBarNode)
-            newBtn = [self buttonAtUv:uv inList:_parsecBarHits];
+            btnHit = [self buttonHitAtUv:uv inList:_parsecBarHits];
         else if (hit.node == self.dockNode)
-            newBtn = [self buttonAtUv:uv inList:_dockHits];
+            btnHit = [self buttonHitAtUv:uv inList:_dockHits];
         else if (hit.node == self.keyboardNode)
-            newBtn = [self buttonAtUv:uv inList:_keyboardHits];
+            btnHit = [self buttonHitAtUv:uv inList:_keyboardHits];
+
+        if (btnHit)
+            newBtn = btnHit->buttonId;
     }
 
-    CFTimeInterval now = CACurrentMediaTime();
+    if (!onInteractiveScreen)
+    {
+        self.screenDwellNodeName = nil;
+        self.screenDwellFired = NO;
+    }
+
     BOOL btnSame = (newBtn == self.dwellButtonId || [newBtn isEqualToString:self.dwellButtonId]);
     if (!btnSame)
     {
@@ -897,18 +1454,12 @@ namespace
         self.flashedButtonId = newBtn;
         self.flashUntil = now + 0.10;
         [self handleButtonClick:newBtn];
+        [self redrawPanelForNodeName:hit.node.name];
     }
 
-    BOOL changed = !((self.hoveredNodeKey == newNode || [self.hoveredNodeKey isEqualToString:newNode]) &&
-                     (self.hoveredButtonId == newBtn || [self.hoveredButtonId isEqualToString:newBtn]));
-    if (changed)
-    {
-        NSString *oldNode = self.hoveredNodeKey;
-        self.hoveredNodeKey = newNode;
-        self.hoveredButtonId = newBtn;
-        [self redrawPanelForNodeName:oldNode];
-        [self redrawPanelForNodeName:newNode];
-    }
+    self.hoveredNodeKey = newNode;
+    self.hoveredButtonId = newBtn;
+    [self applyHoverOverlayToNode:hit.node buttonHit:btnHit];
 }
 
 - (CGPoint)averageTouchPointInSet:(NSSet<UITouch *> *)touches
@@ -942,10 +1493,10 @@ namespace
     if (!touch)
         return;
     CGPoint pt = [touch locationInView:self.view];
-    SCNHitTestResult *hit = [self raycastTouchPoint:pt];
-    if (!hit && !self.singleScreenTouchMode)
+    VRRayHit hit = [self raycastTouchPoint:pt];
+    if (!hit.node && !self.singleScreenTouchMode)
         hit = [self raycastCenterGaze:nil dir:nil];
-    [self handleHitDown:hit fromDirectTouch:YES];
+    [self handleRayHitDown:hit fromDirectTouch:YES];
 }
 
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
@@ -958,9 +1509,9 @@ namespace
         if (fabs(dy) >= 2.0)
         {
             self.twoFingerScrollLastY = avg.y;
-            SCNHitTestResult *hit = [self raycastTouchPoint:avg];
+            VRRayHit hit = [self raycastTouchPoint:avg];
             BOOL isSideBar = NO;
-            int sideIdx = hit ? [self sideSlotIndexForNode:hit.node isBar:&isSideBar] : -1;
+            int sideIdx = hit.node ? [self sideSlotIndexForNode:hit.node isBar:&isSideBar] : -1;
             if (self.parsecConnected && (hit.node == self.parsecScreenNode || self.inputTarget == InputTarget::ParsecHost || (sideIdx >= 0 && _sideSlots[sideIdx].useParsecStream2)))
                 VRParsecSendMouseWheel(0, static_cast<int>(dy * 5.0));
             else if (sideIdx >= 0 && !isSideBar)
@@ -973,11 +1524,11 @@ namespace
     if (!touch)
         return;
     CGPoint pt = [touch locationInView:self.view];
-    SCNHitTestResult *hit = [self raycastTouchPoint:pt];
-    if (!hit)
+    VRRayHit hit = [self raycastTouchPoint:pt];
+    if (!hit.node)
         return;
 
-    CGPoint uv = [self topLeftUvForHit:hit];
+    CGPoint uv = hit.uv;
     BOOL isSideBar = NO;
     int sideIdx = [self sideSlotIndexForNode:hit.node isBar:&isSideBar];
     int maxW = std::max(1, self.hostWidth - 1);
@@ -1007,13 +1558,10 @@ namespace
 
     if (hit.node == self.keyboardNode)
     {
-        NSString *btn = [self buttonAtUv:uv inList:_keyboardHits];
-        if (![self.hoveredButtonId isEqualToString:btn])
-        {
-            self.hoveredNodeKey = hit.node.name;
-            self.hoveredButtonId = btn;
-            [self redrawKeyboardPanel];
-        }
+        const VRButtonHit *btn = [self buttonHitAtUv:uv inList:_keyboardHits];
+        self.hoveredNodeKey = hit.node.name;
+        self.hoveredButtonId = btn ? btn->buttonId : nil;
+        [self applyHoverOverlayToNode:hit.node buttonHit:btn];
     }
 }
 
@@ -1062,12 +1610,12 @@ namespace
     if (idx >= 0) [self redrawSideBar:idx];
 }
 
-- (void)handleHitDown:(SCNHitTestResult *)hit fromDirectTouch:(BOOL)isDirectTouch
+- (void)handleRayHitDown:(VRRayHit)hit fromDirectTouch:(BOOL)isDirectTouch
 {
     CFTimeInterval now = CACurrentMediaTime();
     if (!isDirectTouch)
     {
-        if (now - self.lastPinchClickAt < 0.22)
+        if (now - self.lastPinchClickAt < 0.16)
             return;
         self.lastPinchClickAt = now;
     }
@@ -1079,10 +1627,10 @@ namespace
         return;
     }
 
-    if (!hit)
+    if (!hit.node)
         return;
 
-    CGPoint uv = [self topLeftUvForHit:hit];
+    CGPoint uv = hit.uv;
     int maxW = std::max(1, self.hostWidth - 1);
     int maxH = std::max(1, self.hostHeight - 1);
 
@@ -1265,11 +1813,22 @@ namespace
     if ([btnId isEqualToString:@"dock_kb"]) { self.keyboardVisible = !self.keyboardVisible; [self applyWorkspaceVisibility]; [self redrawDockPanel]; return; }
     if ([btnId isEqualToString:@"dock_rclick"]) { self.rightClickArmed = !self.rightClickArmed; [self redrawDockPanel]; return; }
     if ([btnId isEqualToString:@"dock_mute"]) { self.muted = !self.muted; VRParsecSetMuted(self.muted ? 1 : 0); [self redrawDockPanel]; return; }
-    if ([btnId isEqualToString:@"dock_handaim"]) { self.handAimEnabled = !self.handAimEnabled; [self redrawDockPanel]; return; }
+    if ([btnId isEqualToString:@"dock_handaim"])
+    {
+        self.handAimEnabled = !self.handAimEnabled;
+        if (!self.handAimEnabled)
+        {
+            self.handTracked = NO;
+            self.fingerPoking = NO;
+            [self hideHandSkeleton];
+        }
+        [self redrawDockPanel];
+        return;
+    }
     if ([btnId isEqualToString:@"dock_recenter"])
     {
-        self.mainAnchorNode.position = SCNVector3Make(0, 0.14f, -kParsecDist);
-        self.mainAnchorNode.eulerAngles = SCNVector3Zero;
+        self.mainAnchorNode.position = SCNVector3Make(0, 0.36f, -kParsecDist);
+        self.mainAnchorNode.eulerAngles = SCNVector3Make(4.0f * M_PI / 180.0f, 0, 0);
         for (int i = 0; i < kMaxWebMonitors; ++i)
             [self resetSideSlotPose:i];
         [self recenterWorkspace];
@@ -1279,9 +1838,9 @@ namespace
     if ([btnId isEqualToString:@"dock_room"])
     {
         self.passthroughOn = !self.passthroughOn;
+        self.cameraBgNode.hidden = !self.passthroughOn;
         self.floorNode.hidden = self.passthroughOn;
-        if (!self.passthroughOn)
-            self.scene.background.contents = ColorHex(0x141218);
+        self.scene.background.contents = ColorHex(0x141218);
         [self redrawDockPanel];
         return;
     }
@@ -1808,15 +2367,12 @@ namespace
           disabled:(BOOL)disabled
            hitList:(std::vector<VRButtonHit> &)hits
 {
-    BOOL hovered = [self.hoveredButtonId isEqualToString:btnId];
     BOOL flashed = [self.flashedButtonId isEqualToString:btnId] && CACurrentMediaTime() < self.flashUntil;
 
     UIColor *bg = ColorHex(0x4A4458);
     UIColor *fg = ColorHex(0xE8DEF8);
     if (flashed || filled || selected) { bg = ColorHex(0xD0BCFF); fg = ColorHex(0x381E72); }
     else if (outlined) { bg = ColorHex(0x2B2930); fg = ColorHex(0xE6E0E9); }
-    if (hovered && !flashed)
-        bg = [bg colorWithAlphaComponent:0.86];
     if (disabled)
     {
         bg = ColorHex(0x36343B, 0.5);
@@ -1826,10 +2382,10 @@ namespace
     UIBezierPath *path = [UIBezierPath bezierPathWithRoundedRect:pxRect cornerRadius:MIN(14.0, pxRect.size.height * 0.45)];
     [bg setFill];
     [path fill];
-    if (outlined || hovered)
+    if (outlined)
     {
-        [(hovered ? ColorHex(0xD0BCFF) : ColorHex(0x938F99)) setStroke];
-        path.lineWidth = hovered ? 3.0 : 1.5;
+        [ColorHex(0x938F99) setStroke];
+        path.lineWidth = 1.5;
         [path stroke];
     }
 
@@ -1869,7 +2425,7 @@ namespace
 {
     _parsecPanelHits.clear();
     CGSize sz = CGSizeMake(920, 660);
-    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:sz];
+    UIGraphicsImageRenderer *r = [self makeUiRendererWithSize:sz];
     UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
         (void)ctx;
         [ColorHex(0x211F26, 0.96) setFill];
@@ -1931,7 +2487,7 @@ namespace
 {
     _parsecBarHits.clear();
     CGSize sz = CGSizeMake(1000, 120);
-    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:sz];
+    UIGraphicsImageRenderer *r = [self makeUiRendererWithSize:sz];
     UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
         (void)ctx;
         [ColorHex(0x211F26, 0.94) setFill];
@@ -1954,7 +2510,7 @@ namespace
     slot.barHits.clear();
 
     CGSize sz = CGSizeMake(1060, 174);
-    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:sz];
+    UIGraphicsImageRenderer *r = [self makeUiRendererWithSize:sz];
     UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
         (void)ctx;
         [ColorHex(0x211F26, 0.94) setFill];
@@ -1992,7 +2548,7 @@ namespace
     NSString *sizeTitle = self.screenSizePreset == 0 ? @"Size: Big" : (self.screenSizePreset == 1 ? @"Size: Giant" : @"Size: IMAX");
 
     CGSize sz = CGSizeMake(1220, 186);
-    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:sz];
+    UIGraphicsImageRenderer *r = [self makeUiRendererWithSize:sz];
     UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
         (void)ctx;
         [ColorHex(0x211F26, 0.94) setFill];
@@ -2026,7 +2582,7 @@ namespace
 - (void)redrawKeyboardPanel
 {
     _keyboardHits.clear();
-    CGSize sz = CGSizeMake(1440, 680);
+    CGSize sz = CGSizeMake(1280, 560);
 
     static const KeySpec r0[] = {
         {"ESC","ESC",1.1f,41},{"1","!",1,30},{"2","@",1,31},{"3","#",1,32},{"4","$",1,33},
@@ -2056,11 +2612,11 @@ namespace
     static const KeySpec *const rows[] = {r0, r1, r2, r3, r4};
     static const int counts[] = {14, 14, 13, 13, 8};
 
-    UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:sz];
+    UIGraphicsImageRenderer *r = [self makeUiRendererWithSize:sz];
     UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
         (void)ctx;
         [ColorHex(0x211F26, 0.94) setFill];
-        [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, sz.width, sz.height) cornerRadius:34] fill];
+        [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, sz.width, sz.height) cornerRadius:30] fill];
 
         NSString *targetStr = @"Target: Parsec Email";
         if (self.inputTarget == InputTarget::ParsecPassword) targetStr = @"Target: Parsec Password";
@@ -2068,13 +2624,13 @@ namespace
         else if (self.inputTarget == InputTarget::WebUrl) targetStr = [NSString stringWithFormat:@"Target: Side Monitor %d URL (Enter opens)", self.activeSideSlot + 1];
         else if (self.inputTarget == InputTarget::ParsecHost) targetStr = @"Target: Remote PC (Parsec Live)";
         else if (self.inputTarget == InputTarget::WebPage) targetStr = [NSString stringWithFormat:@"Target: Side Monitor %d Web Input", self.activeSideSlot + 1];
-        [self drawText:targetStr rect:CGRectMake(28, 16, sz.width - 56, 38) size:25 color:ColorHex(0xD0BCFF) bold:YES align:NSTextAlignmentCenter];
+        [self drawText:targetStr rect:CGRectMake(24, 14, sz.width - 48, 34) size:22 color:ColorHex(0xD0BCFF) bold:YES align:NSTextAlignmentCenter];
 
-        CGFloat usableW = sz.width - 40.0;
-        CGFloat gap = 10.0;
-        CGFloat rowH = 104.0;
-        CGFloat rowStep = 118.0;
-        CGFloat startY = 66.0;
+        CGFloat usableW = sz.width - 36.0;
+        CGFloat gap = 8.0;
+        CGFloat rowH = 84.0;
+        CGFloat rowStep = 98.0;
+        CGFloat startY = 58.0;
 
         for (int row = 0; row < 5; ++row)
         {
