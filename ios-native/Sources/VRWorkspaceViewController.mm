@@ -789,9 +789,9 @@ namespace
         self.nextPassthroughAt = now + (1.0 / 30.0);
         self.passthroughBusy = YES;
         CVPixelBufferRef pb = CVPixelBufferRetain(frame.capturedImage);
-        __weak typeof(self) weakSelf = self;
+        __weak VRWorkspaceViewController *weakSelf = self;
         dispatch_async(self.passthroughQueue, ^{
-            typeof(self) strongSelf = weakSelf;
+            VRWorkspaceViewController *strongSelf = weakSelf;
             if (strongSelf)
                 [strongSelf updatePassthroughBackground:pb orientation:orient];
             else
@@ -808,9 +808,9 @@ namespace
             ? kCGImagePropertyOrientationDown
             : kCGImagePropertyOrientationUp;
 
-        __weak typeof(self) weakSelf = self;
+        __weak VRWorkspaceViewController *weakSelf = self;
         dispatch_async(self.visionQueue, ^{
-            typeof(self) strongSelf = weakSelf;
+            VRWorkspaceViewController *strongSelf = weakSelf;
             if (strongSelf)
                 [strongSelf processHandPoseOnBuffer:pb orientation:cgOrient];
             CVPixelBufferRelease(pb);
@@ -822,7 +822,7 @@ namespace
 {
     if (!pixelBuffer)
     {
-        __weak typeof(self) weakSelf = self;
+        __weak VRWorkspaceViewController *weakSelf = self;
         dispatch_async(dispatch_get_main_queue(), ^{
             weakSelf.passthroughBusy = NO;
         });
@@ -849,9 +849,9 @@ namespace
     }
     CVPixelBufferRelease(pixelBuffer);
 
-    __weak typeof(self) weakSelf = self;
+    __weak VRWorkspaceViewController *weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
-        typeof(self) strongSelf = weakSelf;
+        VRWorkspaceViewController *strongSelf = weakSelf;
         if (strongSelf)
         {
             if (bg && strongSelf.passthroughOn)
@@ -943,9 +943,9 @@ namespace
         }
     }
 
-    __weak typeof(self) weakSelf = self;
+    __weak VRWorkspaceViewController *weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{
-        typeof(self) strongSelf = weakSelf;
+        VRWorkspaceViewController *strongSelf = weakSelf;
         if (!strongSelf)
             return;
 
