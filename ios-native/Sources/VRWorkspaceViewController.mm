@@ -1827,8 +1827,8 @@ namespace
         {"SPACE","SPACE",4.2f,44},{"LEFT","LEFT",1.1f,80},{"DOWN","DOWN",1.1f,81},{"RIGHT","RIGHT",1.1f,79}
     };
 
-    const KeySpec *rows[] = {r0, r1, r2, r3, r4};
-    const int counts[] = {14, 14, 13, 13, 8};
+    static const KeySpec *const rows[] = {r0, r1, r2, r3, r4};
+    static const int counts[] = {14, 14, 13, 13, 8};
 
     UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:sz];
     UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
