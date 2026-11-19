@@ -59,14 +59,18 @@ jobs:
             echo "has_license=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install Unity Hub and Unity 6000.6.8f1 with iOS support
+      - name: Install Unity 6000.6.8f1 and iOS Build Support
         if: steps.check_xcode.outputs.exists == 'false'
         run: |
-          brew install --cask unity-hub
-          UNITY_HUB="/Applications/Unity Hub.app/Contents/MacOS/Unity Hub"
-          if [ ! -x "/Applications/Unity/Hub/Editor/6000.6.8f1/Unity.app/Contents/MacOS/Unity" ]; then
-            "$UNITY_HUB" -- --headless install --version 6000.6.8f1 --changeset 237b6593792b --module ios --childModules
+          if [ ! -x "/Applications/Unity/Unity.app/Contents/MacOS/Unity" ]; then
+            curl -fL --retry 3 "https://download.unity3d.com/download_unity/237b6593792b/MacEditorInstallerArm64/Unity.pkg" -o /tmp/Unity.pkg
+            sudo installer -pkg /tmp/Unity.pkg -target /
+            rm -f /tmp/Unity.pkg
+            curl -fL --retry 3 "https://download.unity3d.com/download_unity/237b6593792b/MacEditorTargetInstaller/UnitySetup-iOS-Support-for-Editor-6000.6.8f1.pkg" -o /tmp/Unity-iOS.pkg
+            sudo installer -pkg /tmp/Unity-iOS.pkg -target /
+            rm -f /tmp/Unity-iOS.pkg
           fi
+          ls -la /Applications/Unity/Unity.app/Contents/MacOS/Unity
 
       - name: Cache Unity Library
         if: steps.check_xcode.outputs.exists == 'false' && steps.check_license.outputs.has_license == 'true'
@@ -82,8 +86,11 @@ jobs:
         run: |
           mkdir -p /tmp/unity_alf
           cd /tmp/unity_alf
-          /Applications/Unity/Hub/Editor/6000.6.8f1/Unity.app/Contents/MacOS/Unity \
-            -batchmode -nographics -createManualActivationFile -logfile /tmp/alf.log || true
+          UNITY_BIN="/Applications/Unity/Unity.app/Contents/MacOS/Unity"
+          if [ ! -x "$UNITY_BIN" ]; then
+            UNITY_BIN="/Applications/Unity/Hub/Editor/6000.6.8f1/Unity.app/Contents/MacOS/Unity"
+          fi
+          "$UNITY_BIN" -batchmode -nographics -createManualActivationFile -logfile /tmp/alf.log || true
           ls -la /tmp/unity_alf
 
       - name: Upload Unity manual activation file (.alf)
@@ -108,7 +115,10 @@ jobs:
         env:
           UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
         run: |
-          UNITY_BIN="/Applications/Unity/Hub/Editor/6000.6.8f1/Unity.app/Contents/MacOS/Unity"
+          UNITY_BIN="/Applications/Unity/Unity.app/Contents/MacOS/Unity"
+          if [ ! -x "$UNITY_BIN" ]; then
+            UNITY_BIN="/Applications/Unity/Hub/Editor/6000.6.8f1/Unity.app/Contents/MacOS/Unity"
+          fi
           sudo mkdir -p "/Library/Application Support/Unity"
           if [ -n "$UNITY_LICENSE" ]; then
             printf '%s' "$UNITY_LICENSE" | sudo tee "/Library/Application Support/Unity/Unity_lic.ulf" >/dev/null
