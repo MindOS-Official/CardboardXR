@@ -21,8 +21,6 @@ namespace
     constexpr float kSideMonitorDist = 1.40f;
     constexpr float kKeyboardDist = 0.68f;
     constexpr float kKeyboardPitchDeg = -26.0f;
-    constexpr CFTimeInterval kHandDwellSeconds = 0.18;
-    constexpr CFTimeInterval kScreenDwellSeconds = 0.30;
     constexpr int kHandJointCount = 21;
     constexpr int kHandBoneCount = 20;
     constexpr const char *kKeychainSessionKey = "cardboardxr_native_parsec_session_v1";
@@ -260,14 +258,12 @@ namespace
 @property (nonatomic, assign) BOOL ctrlOn;
 @property (nonatomic, assign) BOOL altOn;
 @property (nonatomic, assign) BOOL winOn;
+@property (nonatomic, assign) BOOL handTrackingEnabled;
 @property (nonatomic, assign) BOOL handAimEnabled;
 
 @property (nonatomic, copy) NSString *hoveredNodeKey;
 @property (nonatomic, copy) NSString *hoveredButtonId;
 @property (nonatomic, copy) NSString *flashedButtonId;
-@property (nonatomic, copy) NSString *dwellButtonId;
-@property (nonatomic, assign) CFTimeInterval dwellStartAt;
-@property (nonatomic, assign) BOOL dwellFiredForHover;
 @property (nonatomic, assign) CFTimeInterval flashUntil;
 @property (nonatomic, assign) CFTimeInterval nextWebSnapshotAt;
 @property (nonatomic, assign) CFTimeInterval nextPassthroughAt;
@@ -280,12 +276,6 @@ namespace
 @property (nonatomic, assign) BOOL pinchClosed;
 @property (nonatomic, assign) BOOL fingerPoking;
 @property (nonatomic, assign) BOOL fingerPokePending;
-@property (nonatomic, assign) CGPoint smoothedHandAim;
-@property (nonatomic, assign) int screenDwellPx;
-@property (nonatomic, assign) int screenDwellPy;
-@property (nonatomic, assign) CFTimeInterval screenDwellStartAt;
-@property (nonatomic, assign) BOOL screenDwellFired;
-@property (nonatomic, copy) NSString *screenDwellNodeName;
 @property (nonatomic, assign) BOOL parsecMouseHeld;
 @property (nonatomic, assign) int heldParsecButton;
 @property (nonatomic, assign) BOOL isTwoFingerScrolling;
@@ -318,7 +308,10 @@ namespace
     SCNVector3 _targetHandJoints[kHandJointCount];
     SCNVector3 _currentHandJoints[kHandJointCount];
     float _targetHandDepth;
-    float _restingHandDepth;
+    float _lastFacingCross;
+    CFTimeInterval _lastHandObsAt;
+    CFTimeInterval _handTurningUntil;
+    int _steadyHandFrames;
 }
 
 - (BOOL)prefersStatusBarHidden { return YES; }
@@ -342,7 +335,8 @@ namespace
     self.screenSizePreset = 1; // Default to Giant monitors.
     self.movingMonitorIndex = -2;
     self.passthroughOn = YES; // GPU Metal passthrough active at startup so user sees their room.
-    self.handAimEnabled = YES; // Visible 3D hand + fingertip poke/dwell enabled at startup.
+    self.handTrackingEnabled = YES; // Visible 3D hand skeleton, thumb-index pinch, and palm menu enabled.
+    self.handAimEnabled = NO; // Default to rock-solid 120 FPS Head Gaze aiming.
     self.singleScreenTouchMode = NO;
     self.keyboardVisible = YES;
     self.hosts = @[];
@@ -640,7 +634,7 @@ namespace
 
     for (int i = 0; i < kHandJointCount; ++i)
     {
-        SCNNode *jn = [SCNNode nodeWithGeometry:(i == 8 ? tipGeo : jointGeo)];
+        SCNNode *jn = [SCNNode nodeWithGeometry:((i == 4 || i == 8) ? tipGeo : jointGeo)];
         jn.hidden = YES;
         jn.renderingOrder = 25;
         [self.headNode addChildNode:jn];
@@ -799,7 +793,7 @@ namespace
         });
     }
 
-    if (self.handAimEnabled && !self.visionBusy && now >= self.nextVisionAt)
+    if (self.handTrackingEnabled && !self.visionBusy && now >= self.nextVisionAt)
     {
         self.nextVisionAt = now + (1.0 / 20.0);
         self.visionBusy = YES;
@@ -872,8 +866,10 @@ namespace
 
     BOOL tracked = NO;
     BOOL palmOpen = NO;
-    CGPoint aimNorm = CGPointMake(0.5, 0.5);
+    BOOL hasPinchJoints = NO;
     float estDepth = 0.45f;
+    float facingCross = 0.0f;
+    float pinchRatio = 1.0f;
     std::vector<SCNVector3> parsedJoints(kHandJointCount, SCNVector3Zero);
 
     if (obs)
@@ -897,7 +893,7 @@ namespace
         if (valid[0] && valid[8])
         {
             tracked = YES;
-            aimNorm = CGPointMake(ptX[8], ptY[8]);
+            hasPinchJoints = (valid[0] && valid[4] && valid[5] && valid[8]);
             for (int i = 1; i < kHandJointCount; ++i)
             {
                 if (!valid[i])
@@ -915,20 +911,30 @@ namespace
             float palmNorm = std::max(0.045f, std::max(palmSpan, knuckSpan));
             estDepth = std::max(0.22f, std::min(0.75f, 0.105f / palmNorm));
 
-            if (valid[5] && valid[17] && valid[12] && valid[16] && valid[20])
+            if (hasPinchJoints)
+            {
+                float tipGap = hypotf((ptX[8] - ptX[4]) * 1.55f, (ptY[8] - ptY[4]));
+                pinchRatio = tipGap / palmNorm;
+            }
+
+            if (valid[5] && valid[17])
             {
                 float ix = ptX[5] - ptX[0], iy = ptY[5] - ptY[0];
                 float px = ptX[17] - ptX[0], py = ptY[17] - ptY[0];
                 float il = hypotf(ix, iy), pl = hypotf(px, py);
-                float facingSin = (il > 1e-4f && pl > 1e-4f) ? fabsf(ix * py - iy * px) / (il * pl) : 0.0f;
+                facingCross = (il > 1e-4f && pl > 1e-4f) ? ((ix * py - iy * px) / (il * pl)) : 0.0f;
+                float facingSin = fabsf(facingCross);
 
-                float dMid = hypotf(ptX[12] - ptX[0], ptY[12] - ptY[0]);
-                float dRing = hypotf(ptX[16] - ptX[0], ptY[16] - ptY[0]);
-                float dPink = hypotf(ptX[20] - ptX[0], ptY[20] - ptY[0]);
-                float dIdx = hypotf(ptX[8] - ptX[0], ptY[8] - ptY[0]);
-                float baseSpan = std::max(0.03f, hypotf(p9x - ptX[0], p9y - ptY[0]));
-                float openRatio = ((dIdx + dMid + dRing + dPink) * 0.25f) / baseSpan;
-                palmOpen = (facingSin >= 0.30f && openRatio >= 1.45f);
+                if (valid[12] && valid[16] && valid[20])
+                {
+                    float dMid = hypotf(ptX[12] - ptX[0], ptY[12] - ptY[0]);
+                    float dRing = hypotf(ptX[16] - ptX[0], ptY[16] - ptY[0]);
+                    float dPink = hypotf(ptX[20] - ptX[0], ptY[20] - ptY[0]);
+                    float dIdx = hypotf(ptX[8] - ptX[0], ptY[8] - ptY[0]);
+                    float baseSpan = std::max(0.03f, hypotf(p9x - ptX[0], p9y - ptY[0]));
+                    float openRatio = ((dIdx + dMid + dRing + dPink) * 0.25f) / baseSpan;
+                    palmOpen = (facingSin >= 0.35f && openRatio >= 1.48f);
+                }
             }
 
             for (int i = 0; i < kHandJointCount; ++i)
@@ -955,65 +961,62 @@ namespace
 
         if (tracked)
         {
-            strongSelf.smoothedHandAim = CGPointMake(strongSelf.smoothedHandAim.x * 0.55 + aimNorm.x * 0.45,
-                                                     strongSelf.smoothedHandAim.y * 0.55 + aimNorm.y * 0.45);
             for (int i = 0; i < kHandJointCount; ++i)
                 strongSelf->_targetHandJoints[i] = parsedJoints[i];
             strongSelf->_targetHandDepth = estDepth;
 
-            if (strongSelf->_restingHandDepth <= 0.01f)
-                strongSelf->_restingHandDepth = estDepth;
+            strongSelf->_steadyHandFrames = hasPinchJoints ? std::min(10, strongSelf->_steadyHandFrames + 1) : 0;
 
-            if (palmOpen)
+            CFTimeInterval dt = (strongSelf->_lastHandObsAt > 0.0) ? (now - strongSelf->_lastHandObsAt) : 0.05;
+            strongSelf->_lastHandObsAt = now;
+            if (dt > 1e-3 && dt < 0.5)
+            {
+                float turnRate = fabsf(facingCross - strongSelf->_lastFacingCross) / static_cast<float>(dt);
+                if (turnRate > 1.8f)
+                    strongSelf->_handTurningUntil = now + 0.24;
+            }
+            strongSelf->_lastFacingCross = facingCross;
+
+            BOOL wantPinch = strongSelf.pinchClosed
+                ? (hasPinchJoints && pinchRatio < 0.72f)
+                : (hasPinchJoints && !palmOpen && pinchRatio < 0.38f &&
+                   now >= strongSelf->_handTurningUntil && strongSelf->_steadyHandFrames >= 2);
+
+            if (wantPinch && !strongSelf.pinchClosed)
+            {
+                strongSelf.pinchClosed = YES;
+                strongSelf.fingerPoking = YES;
+                strongSelf.fingerPokePending = YES;
+            }
+            else if (!wantPinch && strongSelf.pinchClosed)
+            {
+                strongSelf.pinchClosed = NO;
+                strongSelf.fingerPoking = NO;
+                [strongSelf handlePrimaryActionUp];
+                if (strongSelf.movingMonitorIndex != -2 && (now - strongSelf.grabStartedAt) >= 0.35)
+                    [strongSelf finishGrabAtCurrentPose];
+            }
+
+            if (palmOpen && !strongSelf.pinchClosed && strongSelf.movingMonitorIndex == -2)
             {
                 if (strongSelf.palmFacingSince <= 0.0)
                     strongSelf.palmFacingSince = now;
-                else if ((now - strongSelf.palmFacingSince) >= 0.22)
-                    strongSelf.palmMenuVisibleUntil = now + 4.5;
+                else if ((now - strongSelf.palmFacingSince) >= 0.32)
+                    strongSelf.palmMenuVisibleUntil = now + 5.0;
             }
             else
             {
                 strongSelf.palmFacingSince = 0.0;
             }
-
-            BOOL nearKeyboard = NO;
-            if (strongSelf.keyboardVisible && !palmOpen)
-            {
-                SCNVector3 tipLocal = strongSelf->_targetHandJoints[8];
-                simd_float4 tipWorld = simd_mul(strongSelf.headNode.simdWorldTransform,
-                                                simd_make_float4(tipLocal.x, tipLocal.y, tipLocal.z, 1.0f));
-                simd_float4 kbPt = simd_mul(simd_inverse(strongSelf.keyboardNode.simdWorldTransform), tipWorld);
-                SCNPlane *kbGeo = (SCNPlane *)strongSelf.keyboardNode.geometry;
-                if (fabsf(kbPt.z) <= 0.055f &&
-                    fabsf(kbPt.x) <= kbGeo.width * 0.52f &&
-                    fabsf(kbPt.y) <= kbGeo.height * 0.52f)
-                {
-                    nearKeyboard = YES;
-                }
-            }
-
-            float pokeThresh = strongSelf.fingerPoking ? 0.016f : 0.025f;
-            BOOL pokeNow = !palmOpen && (((strongSelf->_restingHandDepth - estDepth) >= pokeThresh) || nearKeyboard);
-            if (!pokeNow)
-                strongSelf->_restingHandDepth = strongSelf->_restingHandDepth * 0.90f + estDepth * 0.10f;
-
-            if (pokeNow && !strongSelf.fingerPoking)
-            {
-                strongSelf.fingerPoking = YES;
-                strongSelf.fingerPokePending = YES;
-            }
-            else if (!pokeNow && strongSelf.fingerPoking)
-            {
-                strongSelf.fingerPoking = NO;
-                [strongSelf handlePrimaryActionUp];
-            }
         }
         else
         {
-            strongSelf->_restingHandDepth = 0.0f;
+            strongSelf->_steadyHandFrames = 0;
+            strongSelf->_lastHandObsAt = 0.0;
             strongSelf.palmFacingSince = 0.0;
-            if (strongSelf.fingerPoking)
+            if (strongSelf.pinchClosed)
             {
+                strongSelf.pinchClosed = NO;
                 strongSelf.fingerPoking = NO;
                 [strongSelf handlePrimaryActionUp];
             }
@@ -1033,7 +1036,7 @@ namespace
 
 - (void)updateHandSkeletonWithHitDist:(float)hitDist hasHit:(BOOL)hasHit
 {
-    if (!self.handAimEnabled || !self.handTracked)
+    if (!self.handTrackingEnabled || !self.handTracked)
     {
         [self hideHandSkeleton];
         return;
@@ -1052,9 +1055,13 @@ namespace
         _handJointNodes[i].hidden = NO;
     }
 
-    self.indexTipMat.diffuse.contents = (self.fingerPoking || self.parsecMouseHeld)
+    BOOL pinchActive = (self.pinchClosed || self.parsecMouseHeld);
+    self.indexTipMat.diffuse.contents = pinchActive
         ? ColorHex(0x4ADE80, 0.98)
         : ColorHex(0x5EEAD4, 0.96);
+    SCNVector3 tipScale = self.pinchClosed ? SCNVector3Make(1.32f, 1.32f, 1.32f) : SCNVector3Make(1.0f, 1.0f, 1.0f);
+    _handJointNodes[4].scale = tipScale;
+    _handJointNodes[8].scale = tipScale;
 
     const simd_float3 up = simd_make_float3(0.0f, 1.0f, 0.0f);
     for (int b = 0; b < kHandBoneCount; ++b)
@@ -1082,7 +1089,7 @@ namespace
             bone.simdOrientation = simd_quaternion(up, dir);
     }
 
-    if (hasHit)
+    if (self.handAimEnabled && hasHit)
     {
         SCNVector3 tip = _currentHandJoints[8];
         float rx = tip.x;
@@ -1229,7 +1236,7 @@ namespace
 
 - (void)updatePalmMenuAtTime:(CFTimeInterval)now
 {
-    BOOL show = self.handAimEnabled && (now < self.palmMenuVisibleUntil);
+    BOOL show = self.handTrackingEnabled && (now < self.palmMenuVisibleUntil);
     if (!show)
     {
         self.palmMenuNode.hidden = YES;
@@ -1280,8 +1287,8 @@ namespace
             [self redrawPalmMenuPanel];
     }
 
-    UIColor *reticleColor = (self.movingMonitorIndex != -2)
-        ? ColorHex(0x80E5A3)
+    UIColor *reticleColor = (self.pinchClosed || self.movingMonitorIndex != -2)
+        ? ColorHex(0x4ADE80)
         : (self.handTracked ? ColorHex(0x5EEAD4) : [UIColor whiteColor]);
     self.leftReticle.layer.borderColor = reticleColor.CGColor;
     self.rightReticle.layer.borderColor = reticleColor.CGColor;
@@ -1533,7 +1540,6 @@ namespace
         _sideSlots[i].cursorNode.hidden = YES;
 
     CFTimeInterval now = CACurrentMediaTime();
-    BOOL onInteractiveScreen = NO;
 
     if (hit.node)
     {
@@ -1567,7 +1573,6 @@ namespace
         }
         else if (hit.node == self.parsecScreenNode && self.parsecConnected)
         {
-            onInteractiveScreen = YES;
             self.parsecCursorNode.hidden = NO;
             SCNPlane *pl = (SCNPlane *)self.parsecScreenNode.geometry;
             self.parsecCursorNode.position = SCNVector3Make((uv.x - 0.5) * pl.width, (0.5 - uv.y) * pl.height, 0.01f);
@@ -1579,37 +1584,9 @@ namespace
                 self.lastMousePy = py;
                 VRParsecSendStreamMousePosition(0, px, py);
             }
-            if (self.handAimEnabled && self.handTracked && self.movingMonitorIndex == -2)
-            {
-                if (![self.screenDwellNodeName isEqualToString:@"parsec_screen"] ||
-                    abs(px - self.screenDwellPx) > 18 || abs(py - self.screenDwellPy) > 18)
-                {
-                    self.screenDwellNodeName = @"parsec_screen";
-                    self.screenDwellPx = px;
-                    self.screenDwellPy = py;
-                    self.screenDwellStartAt = now;
-                    self.screenDwellFired = NO;
-                }
-                else if (!self.screenDwellFired && (now - self.screenDwellStartAt) >= kScreenDwellSeconds)
-                {
-                    self.screenDwellFired = YES;
-                    AudioServicesPlaySystemSound(1104);
-                    int btn = self.rightClickArmed ? 3 : 1;
-                    VRParsecSendMouseButton(btn, 1);
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                        VRParsecSendMouseButton(btn, 0);
-                    });
-                    if (self.rightClickArmed)
-                    {
-                        self.rightClickArmed = NO;
-                        [self redrawDockPanel];
-                    }
-                }
-            }
         }
         else if (sideIdx >= 0 && !isSideBar)
         {
-            onInteractiveScreen = YES;
             SideMonitorSlot &slot = _sideSlots[sideIdx];
             slot.cursorNode.hidden = NO;
             SCNPlane *pl = (SCNPlane *)slot.screenNode.geometry;
@@ -1618,36 +1595,6 @@ namespace
             int py = static_cast<int>(uv.y * maxH);
             if (slot.useParsecStream2 && self.parsecConnected && !self.singleScreenTouchMode)
                 VRParsecSendStreamMousePosition(1, px, py);
-            if (self.handAimEnabled && self.handTracked && self.movingMonitorIndex == -2)
-            {
-                NSString *sName = hit.node.name;
-                if (![self.screenDwellNodeName isEqualToString:sName] ||
-                    abs(px - self.screenDwellPx) > 18 || abs(py - self.screenDwellPy) > 18)
-                {
-                    self.screenDwellNodeName = sName;
-                    self.screenDwellPx = px;
-                    self.screenDwellPy = py;
-                    self.screenDwellStartAt = now;
-                    self.screenDwellFired = NO;
-                }
-                else if (!self.screenDwellFired && (now - self.screenDwellStartAt) >= kScreenDwellSeconds)
-                {
-                    self.screenDwellFired = YES;
-                    AudioServicesPlaySystemSound(1104);
-                    if (slot.useParsecStream2 && self.parsecConnected)
-                    {
-                        int btn = self.rightClickArmed ? 3 : 1;
-                        VRParsecSendMouseButton(btn, 1);
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                            VRParsecSendMouseButton(btn, 0);
-                        });
-                    }
-                    else
-                    {
-                        VRWebClickSlot(sideIdx, static_cast<float>(uv.x), static_cast<float>(uv.y));
-                    }
-                }
-            }
         }
         else if (sideIdx >= 0 && isSideBar)
             btnHit = [self buttonHitAtUv:uv inList:_sideSlots[sideIdx].barHits];
@@ -1662,37 +1609,6 @@ namespace
 
         if (btnHit)
             newBtn = btnHit->buttonId;
-    }
-
-    if (!onInteractiveScreen)
-    {
-        self.screenDwellNodeName = nil;
-        self.screenDwellFired = NO;
-    }
-
-    BOOL btnSame = (newBtn == self.dwellButtonId || [newBtn isEqualToString:self.dwellButtonId]);
-    if (!btnSame)
-    {
-        self.dwellButtonId = newBtn;
-        self.dwellStartAt = now;
-        self.dwellFiredForHover = NO;
-    }
-    else if (self.handAimEnabled && self.handTracked && newBtn != nil && !self.dwellFiredForHover &&
-             (now - self.dwellStartAt) >= kHandDwellSeconds)
-    {
-        self.dwellFiredForHover = YES;
-        if ([newBtn hasPrefix:@"__grab_"])
-        {
-            [self startGrabForIndex:[[newBtn substringFromIndex:7] intValue]];
-        }
-        else
-        {
-            AudioServicesPlaySystemSound(1104);
-            self.flashedButtonId = newBtn;
-            self.flashUntil = now + 0.10;
-            [self handleButtonClick:newBtn];
-            [self redrawPanelForNodeName:hit.node.name];
-        }
     }
 
     self.hoveredNodeKey = newNode;
@@ -2076,13 +1992,16 @@ namespace
     if ([btnId isEqualToString:@"dock_mute"]) { self.muted = !self.muted; VRParsecSetMuted(self.muted ? 1 : 0); [self redrawDockPanel]; return; }
     if ([btnId isEqualToString:@"dock_handaim"])
     {
-        self.handAimEnabled = !self.handAimEnabled;
-        if (!self.handAimEnabled)
+        self.handTrackingEnabled = !self.handTrackingEnabled;
+        if (!self.handTrackingEnabled)
         {
             self.handTracked = NO;
+            self.pinchClosed = NO;
             self.fingerPoking = NO;
+            self.fingerPokePending = NO;
             self.palmMenuVisibleUntil = 0.0;
             self.palmMenuNode.hidden = YES;
+            _steadyHandFrames = 0;
             [self hideHandSkeleton];
         }
         [self redrawDockPanel];
@@ -2921,8 +2840,8 @@ namespace
 
         [self drawButton:CGRectMake(20, 102, 220, 66) canvas:sz buttonId:@"dock_mute" title:(self.muted ? @"Audio: Muted" : @"Audio: On")
                 selected:self.muted outlined:NO filled:NO disabled:NO hitList:_dockHits];
-        [self drawButton:CGRectMake(254, 102, 254, 66) canvas:sz buttonId:@"dock_handaim" title:(self.handAimEnabled ? @"Aim: Hand Ray" : @"Aim: Head Gaze")
-                selected:self.handAimEnabled outlined:NO filled:NO disabled:NO hitList:_dockHits];
+        [self drawButton:CGRectMake(254, 102, 254, 66) canvas:sz buttonId:@"dock_handaim" title:(self.handTrackingEnabled ? @"Hands: Pinch ON" : @"Hands: OFF")
+                selected:self.handTrackingEnabled outlined:NO filled:NO disabled:NO hitList:_dockHits];
         [self drawButton:CGRectMake(522, 102, 260, 66) canvas:sz buttonId:@"dock_recenter" title:@"Recenter Cockpit"
                 selected:NO outlined:YES filled:NO disabled:NO hitList:_dockHits];
         [self drawButton:CGRectMake(796, 102, 404, 66) canvas:sz buttonId:@"dock_room" title:(self.passthroughOn ? @"Room: Passthrough" : @"Room: VR Grid")
