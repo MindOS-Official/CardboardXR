@@ -1,0 +1,47 @@
+name: CardboardXRDesktop
+options:
+  bundleIdPrefix: com.brenpoly
+  deploymentTarget:
+    iOS: "15.0"
+targets:
+  CardboardXRDesktop:
+    type: application
+    platform: iOS
+    deploymentTarget: "15.0"
+    sources:
+      - path: Sources
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.brenpoly.cardboardxr.desktop
+        INFOPLIST_FILE: Info.plist
+        CLANG_CXX_LANGUAGE_STANDARD: c++17
+        CLANG_ENABLE_OBJC_ARC: YES
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/Frameworks"
+        FRAMEWORK_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(PROJECT_DIR)/Frameworks"
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+        ENABLE_BITCODE: NO
+    dependencies:
+      - framework: Frameworks/ParsecSDK.framework
+        embed: true
+        codeSign: false
+      - sdk: ARKit.framework
+      - sdk: SceneKit.framework
+      - sdk: Vision.framework
+      - sdk: WebKit.framework
+      - sdk: Metal.framework
+      - sdk: AudioToolbox.framework
+      - sdk: AVFoundation.framework
+      - sdk: Security.framework
+      - sdk: CoreGraphics.framework
+      - sdk: CoreVideo.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreImage.framework
+      - sdk: QuartzCore.framework
+      - sdk: UIKit.framework
+      - sdk: Foundation.framework

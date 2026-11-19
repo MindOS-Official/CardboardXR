@@ -18,6 +18,16 @@ namespace CardboardXR.Demos.Desktop
         const float k_WebSideDistance = 1.75f;
         const float k_WebRefreshInterval = 1f / 30f;
 
+        static readonly float[] k_MonitorScales = { 1.0f, 1.35f, 1.70f };
+        static readonly string[] k_SizePresetLabels = { "Normal", "Giant", "IMAX" };
+        static readonly Vector3[] k_SideMonitorAngles =
+        {
+            new Vector3(-38f, -4f, 1.78f),
+            new Vector3(66f, -4f, 1.76f),
+            new Vector3(-68f, -4f, 1.76f),
+            new Vector3(0f, 26f, 1.88f),
+        };
+
         enum WorkspaceMode
         {
             ParsecAndWeb = 0,
@@ -42,6 +52,7 @@ namespace CardboardXR.Demos.Desktop
         Transform m_WorkspaceRoot;
         SpatialScreenSurface m_ParsecScreen;
         SpatialScreenSurface m_WebScreen;
+        readonly List<SpatialScreenSurface> m_ExtraMonitors = new();
         SpatialAirKeyboard m_Keyboard;
 
         RectTransform m_ControlBar;
@@ -50,6 +61,8 @@ namespace CardboardXR.Demos.Desktop
         M3Button m_RightClickToggle;
         M3Button m_MuteToggle;
         M3Button m_RoomToggle;
+        M3Button m_AddMonitorButton;
+        M3Button m_MonitorSizeButton;
 
         RectTransform m_ParsecHeaderBar;
         TMP_Text m_ParsecHeaderStatus;
@@ -91,6 +104,7 @@ namespace CardboardXR.Demos.Desktop
         bool m_ParsecConnected;
         bool m_RightClickArmed;
         bool m_Muted;
+        int m_SizePreset = 1;
         bool m_ParsecMouseDown;
         int m_HeldParsecButton = ParsecNative.MouseLeft;
         int m_LastSentPx = -1;
@@ -116,6 +130,7 @@ namespace CardboardXR.Demos.Desktop
             BuildWebBar();
             BuildKeyboard();
 
+            ApplyScaleToMonitors();
             RecenterWorkspace();
             ApplyWorkspaceMode(WorkspaceMode.ParsecAndWeb);
 
@@ -178,8 +193,7 @@ namespace CardboardXR.Demos.Desktop
                 return true;
             }
 
-            if (ReferenceEquals(gazeTarget, m_WebScreen.ColliderObject) &&
-                m_WebScreen.TryRaycast(ray, out var webUv))
+            if (TryRaycastAnyWebMonitor(gazeTarget, ray, out _, out var webUv))
             {
                 m_Focus = InputTarget.WebPage;
                 UpdateKeyboardBanner();
@@ -225,6 +239,12 @@ namespace CardboardXR.Demos.Desktop
 
             var webHit = m_WebScreen.TryRaycast(ray, out var webUv);
             m_WebScreen.SetCursor(webHit, webUv);
+            for (var i = 0; i < m_ExtraMonitors.Count; i++)
+            {
+                var extra = m_ExtraMonitors[i];
+                var extraHit = extra.TryRaycast(ray, out var extraUv);
+                extra.SetCursor(extraHit, extraUv);
+            }
         }
 
         void UpdateParsecRuntime()
@@ -297,6 +317,11 @@ namespace CardboardXR.Demos.Desktop
             {
                 m_NextWebRefresh = now + k_WebRefreshInterval;
                 WebViewNative.UpdateTexture(m_WebScreen.Texture);
+                for (var i = 0; i < m_ExtraMonitors.Count; i++)
+                {
+                    if (m_ExtraMonitors[i].gameObject.activeInHierarchy)
+                        Graphics.Blit(m_WebScreen.Texture, m_ExtraMonitors[i].Texture);
+                }
             }
 
             if (now >= m_NextWebUrlSync)
@@ -331,26 +356,33 @@ namespace CardboardXR.Demos.Desktop
 
         void BuildControlBar()
         {
-            m_ControlBar = WorldUi.Panel("Desktop Controls", m_WorkspaceRoot, new Vector2(760f, 128f), k_ParsecDistance);
+            m_ControlBar = WorldUi.Panel("Desktop Controls", m_WorkspaceRoot, new Vector2(820f, 184f), k_ParsecDistance);
             m_ModeSegments = M3.Segments("Mode", m_ControlBar, new[] { "Parsec + Web", "Parsec Only", "Web Only" },
-                new Vector2(-170f, 28f), 130f, index => ApplyWorkspaceMode((WorkspaceMode)index));
+                new Vector2(-190f, 52f), 130f, index => ApplyWorkspaceMode((WorkspaceMode)index));
 
             m_KeyboardToggle = M3.Button("Keyboard", m_ControlBar, "Keyboard", M3Button.Variant.Tonal,
-                new Vector2(140f, 28f), ToggleKeyboard, "keyboard", 132f);
+                new Vector2(130f, 52f), ToggleKeyboard, "keyboard", 136f);
             m_KeyboardToggle.Selected = true;
 
             m_RightClickToggle = M3.Button("RightClick", m_ControlBar, "Right Click", M3Button.Variant.Tonal,
-                new Vector2(288f, 28f), ToggleRightClick, "touch_app", 142f);
+                new Vector2(286f, 52f), ToggleRightClick, "touch_app", 150f);
 
             m_MuteToggle = M3.Button("Mute", m_ControlBar, "Audio On", M3Button.Variant.Tonal,
-                new Vector2(-264f, -32f), ToggleMute, "volume_up", 144f);
+                new Vector2(-280f, -4f), ToggleMute, "volume_up", 144f);
             M3.Button("Recenter", m_ControlBar, "Recenter", M3Button.Variant.Tonal,
-                new Vector2(-104f, -32f), RecenterWorkspace, "open_with", 140f);
+                new Vector2(-118f, -4f), RecenterWorkspace, "open_with", 140f);
             M3.Button("FlipY", m_ControlBar, "Flip Y", M3Button.Variant.Tonal,
-                new Vector2(52f, -32f), FlipActiveTextures, "refresh", 124f);
+                new Vector2(40f, -4f), FlipActiveTextures, "refresh", 124f);
             m_RoomToggle = M3.Button("Room", m_ControlBar, "Passthrough", M3Button.Variant.Tonal,
-                new Vector2(228f, -32f), ToggleRoom, "visibility", 168f);
+                new Vector2(226f, -4f), ToggleRoom, "visibility", 174f);
             m_RoomToggle.Selected = m_Core.Passthrough != null && m_Core.Passthrough.IsOn;
+
+            m_AddMonitorButton = M3.Button("AddMonitor", m_ControlBar, "+ Monitor (0/4)", M3Button.Variant.Filled,
+                new Vector2(-190f, -60f), AddSideMonitor, "desktop_windows", 210f);
+            m_MonitorSizeButton = M3.Button("MonitorSize", m_ControlBar, "Size: Giant", M3Button.Variant.Tonal,
+                new Vector2(36f, -60f), CycleMonitorSize, "aspect_ratio", 190f);
+            M3.Button("ClearMonitors", m_ControlBar, "Clear Side", M3Button.Variant.Outlined,
+                new Vector2(246f, -60f), ClearExtraMonitors, "close", 170f);
         }
 
         void BuildParsecPanels()
@@ -461,6 +493,8 @@ namespace CardboardXR.Demos.Desktop
 
             m_WebScreen.SetVisible(showWeb);
             m_WebBar.gameObject.SetActive(showWeb);
+            for (var i = 0; i < m_ExtraMonitors.Count; i++)
+                m_ExtraMonitors[i].SetVisible(showWeb);
             PositionWebWorkspace(mode == WorkspaceMode.WebOnly);
         }
 
@@ -495,6 +529,7 @@ namespace CardboardXR.Demos.Desktop
             WorldUi.PlaceInFront(m_ParsecHeaderBar, head, k_ParsecDistance, 21f, 0f);
             WorldUi.PlaceInFront(m_ControlBar, head, k_ParsecDistance, -24f, 0f);
             PositionWebWorkspace(m_Mode == WorkspaceMode.WebOnly);
+            PositionExtraMonitors();
             m_Keyboard.PlaceInFront();
             Debug.Log("[Desktop] Recentered monitors, control bar, and keyboard");
         }
@@ -861,6 +896,97 @@ namespace CardboardXR.Demos.Desktop
         {
             m_ParsecScreen.ToggleFlipY();
             m_WebScreen.ToggleFlipY();
+            for (var i = 0; i < m_ExtraMonitors.Count; i++)
+                m_ExtraMonitors[i].ToggleFlipY();
+        }
+
+        bool TryRaycastAnyWebMonitor(GameObject gazeTarget, Ray ray, out SpatialScreenSurface hitScreen, out Vector2 uv)
+        {
+            if (ReferenceEquals(gazeTarget, m_WebScreen.ColliderObject) && m_WebScreen.TryRaycast(ray, out uv))
+            {
+                hitScreen = m_WebScreen;
+                return true;
+            }
+            for (var i = 0; i < m_ExtraMonitors.Count; i++)
+            {
+                var extra = m_ExtraMonitors[i];
+                if (ReferenceEquals(gazeTarget, extra.ColliderObject) && extra.TryRaycast(ray, out uv))
+                {
+                    hitScreen = extra;
+                    return true;
+                }
+            }
+            hitScreen = null;
+            uv = Vector2.zero;
+            return false;
+        }
+
+        void AddSideMonitor()
+        {
+            if (m_ExtraMonitors.Count >= k_SideMonitorAngles.Length)
+                return;
+
+            var idx = m_ExtraMonitors.Count;
+            var go = new GameObject($"Side Monitor {idx + 1}");
+            go.transform.SetParent(m_WorkspaceRoot, false);
+            var surface = go.AddComponent<SpatialScreenSurface>();
+            surface.Initialize($"Side_{idx + 1}", 1280, 800, new Vector2(1.36f, 0.85f), m_ScreenMaterial);
+            if (m_WebScreen.FlipY)
+                surface.ToggleFlipY();
+            surface.SetVisible(m_Mode != WorkspaceMode.ParsecOnly);
+            m_ExtraMonitors.Add(surface);
+
+            ApplyScaleToMonitors();
+            PositionExtraMonitor(idx);
+            m_AddMonitorButton.Text = m_ExtraMonitors.Count >= k_SideMonitorAngles.Length
+                ? $"Side Full ({m_ExtraMonitors.Count}/4)"
+                : $"+ Monitor ({m_ExtraMonitors.Count}/4)";
+        }
+
+        void ClearExtraMonitors()
+        {
+            for (var i = 0; i < m_ExtraMonitors.Count; i++)
+                Destroy(m_ExtraMonitors[i].gameObject);
+            m_ExtraMonitors.Clear();
+            m_AddMonitorButton.Text = "+ Monitor (0/4)";
+        }
+
+        void CycleMonitorSize()
+        {
+            m_SizePreset = (m_SizePreset + 1) % k_SizePresetLabels.Length;
+            m_MonitorSizeButton.Text = $"Size: {k_SizePresetLabels[m_SizePreset]}";
+            ApplyScaleToMonitors();
+        }
+
+        void ApplyScaleToMonitors()
+        {
+            var s = Vector3.one * k_MonitorScales[m_SizePreset];
+            if (m_ParsecScreen != null)
+                m_ParsecScreen.transform.localScale = s;
+            if (m_WebScreen != null)
+                m_WebScreen.transform.localScale = s;
+            for (var i = 0; i < m_ExtraMonitors.Count; i++)
+                m_ExtraMonitors[i].transform.localScale = s;
+        }
+
+        void PositionExtraMonitors()
+        {
+            for (var i = 0; i < m_ExtraMonitors.Count; i++)
+                PositionExtraMonitor(i);
+        }
+
+        void PositionExtraMonitor(int index)
+        {
+            if (index < 0 || index >= m_ExtraMonitors.Count || index >= k_SideMonitorAngles.Length)
+                return;
+            var head = m_Core.Head;
+            var flat = Vector3.ProjectOnPlane(head.forward, Vector3.up);
+            var yawRot = flat.sqrMagnitude > 1e-4f ? Quaternion.LookRotation(flat.normalized) : Quaternion.identity;
+            var layout = k_SideMonitorAngles[index];
+            var dir = yawRot * Quaternion.Euler(-layout.y, layout.yaw, 0f) * Vector3.forward;
+            var pos = head.position + dir * layout.dist;
+            var rot = Quaternion.LookRotation(pos - head.position, Vector3.up);
+            m_ExtraMonitors[index].transform.SetPositionAndRotation(pos, rot);
         }
 
         void ToggleRoom()
