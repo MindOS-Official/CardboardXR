@@ -1,12 +1,14 @@
-// Dedicated 120 FPS VR Box Parsec Cinema app controlled by Xbox / MFi controller (GameController.framework).
-// Features tunable VR Box inward viewport spacing for crisp eye fusion, zero-disparity stereo axis,
-// Cinema Black 120 FPS mode or optional ARKit room passthrough, and full Mouse + native Xbox 360 gamepad pass-through.
+// Dedicated 120 FPS Cardboard QR (VR BOX) Parsec Cinema app controlled by Xbox / MFi controller.
+// Implements Google Cardboard asymmetric lens frustums, 40x40 polynomial radial barrel distortion
+// decoded from the user's VR BOX QR profile (https://goo.gl/Dv8mJO), 120 Hz CoreMotion IMU head
+// tracking with gyro prediction + ARKit 6DoF fusion, and native Parsec gamepad pass-through.
 
 #import "VRWorkspaceViewController.h"
 #import "VRBridge.h"
 #import <ARKit/ARKit.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreImage/CoreImage.h>
+#import <CoreMotion/CoreMotion.h>
 #import <GameController/GameController.h>
 #import <Metal/Metal.h>
 #import <SceneKit/SceneKit.h>
@@ -17,18 +19,30 @@
 
 namespace
 {
-    constexpr float kBaseScreenWidth = 1.72f;
-    constexpr float kDefaultScreenScale = 1.05f;
-    constexpr float kDefaultScreenDist = 1.35f;
-    constexpr float kDefaultLensSpacing = 0.40f; // 40% of landscape width per eye (~56 mm center-to-center on iPhone 14 Pro)
-    constexpr float kDefaultEyeHeight = 0.86f;
-    constexpr float kDefaultFov = 78.0f;
+    constexpr float kBaseScreenWidth = 1.92f;
+    constexpr float kDefaultScreenScale = 1.15f;
+    constexpr float kDefaultScreenDist = 1.42f;
+    constexpr int kMeshResolution = 40;
+    constexpr float kDefaultBorderMeters = 0.003f;
+    constexpr float kMetersPerInch = 0.0254f;
     constexpr const char *kKeychainSessionKey = "cardboardxr_native_parsec_session_v1";
 
-    NSString *const kPrefLensSpacing = @"vrbox_lens_spacing_v1";
-    NSString *const kPrefEyeHeight = @"vrbox_eye_height_v1";
-    NSString *const kPrefScreenScale = @"vrbox_screen_scale_v1";
-    NSString *const kPrefScreenDist = @"vrbox_screen_dist_v1";
+    NSString *const kPrefQrInterLens = @"vrbox_qr_interlens_v2";
+    NSString *const kPrefScreenScale = @"vrbox_screen_scale_v2";
+    NSString *const kPrefScreenDist = @"vrbox_screen_dist_v2";
+
+    // Decoded from user's uploaded Cardboard QR code (https://goo.gl/Dv8mJO -> google.com/cardboard/cfg?p=...)
+    // Vendor: "VR BOX (Measured by 'Sites in VR')", Model: "VR BOX"
+    struct CardboardViewerParams
+    {
+        float screenToLensDistance = 0.066819f;
+        float interLensDistance = 0.063000f;
+        float trayToLensDistance = 0.040000f;
+        int verticalAlignment = 0; // 0 = Bottom tray
+        float maxFovDeg[4] = {60.029064f, 60.029064f, 60.029064f, 60.029064f}; // L, R, B, T
+        float k1 = 0.26407f;
+        float k2 = 0.34213f;
+    };
 
     // ParsecSDK ParsecGamepadState bitmask values (from parsec.h)
     constexpr uint16_t kParsecBtnDpadUp = 0x0001;
@@ -46,13 +60,6 @@ namespace
     constexpr uint16_t kParsecBtnB = 0x2000;
     constexpr uint16_t kParsecBtnX = 0x4000;
     constexpr uint16_t kParsecBtnY = 0x8000;
-
-    enum class LoginField
-    {
-        Email = 0,
-        Password = 1,
-        Tfa = 2,
-    };
 
     struct VRButtonHit
     {
@@ -119,27 +126,181 @@ namespace
             return 0;
         return static_cast<uint8_t>(clamped * 255.0f);
     }
+
+    // Polynomial radial distortion p' = p (1 + K1 r^2 + K2 r^4), matching Cardboard SDK & LensDistortion.cs
+    static float DistortRadius(float r, float k1, float k2)
+    {
+        float r2 = r * r;
+        return r * (1.0f + k1 * r2 + k2 * r2 * r2);
+    }
+
+    static float DistortInverseRadius(float targetR, float k1, float k2)
+    {
+        if (targetR < 1e-6f)
+            return 0.0f;
+        float r0 = targetR * 0.5f;
+        float r1 = targetR / 3.0f;
+        float dr0 = targetR - DistortRadius(r0, k1, k2);
+        for (int i = 0; i < 100 && fabsf(r1 - r0) > 0.0001f; ++i)
+        {
+            float dr1 = targetR - DistortRadius(r1, k1, k2);
+            if (fabsf(dr1 - dr0) < 1e-7f)
+                break;
+            float r2 = r1 - dr1 * ((r1 - r0) / (dr1 - dr0));
+            r0 = r1;
+            r1 = r2;
+            dr0 = dr1;
+        }
+        return r1;
+    }
+
+    static float GetEyeOffsetYMeters(const CardboardViewerParams &v, float screenH)
+    {
+        if (v.verticalAlignment == 0) // Bottom tray
+            return v.trayToLensDistance - kDefaultBorderMeters;
+        if (v.verticalAlignment == 2) // Top tray
+            return screenH - v.trayToLensDistance - kDefaultBorderMeters;
+        return screenH * 0.5f;
+    }
+
+    // Returns asymmetric per-eye FOV in radians as simd_float4(left, right, bottom, top).
+    static simd_float4 ComputeEyeFov(int eye, const CardboardViewerParams &v, float screenW, float screenH)
+    {
+        float toLens = std::max(0.01f, v.screenToLensDistance);
+        float outerD = (screenW - v.interLensDistance) * 0.5f;
+        float innerD = v.interLensDistance * 0.5f;
+        float bottomD = GetEyeOffsetYMeters(v, screenH);
+        float topD = screenH - bottomD;
+
+        float deg2rad = static_cast<float>(M_PI / 180.0);
+        float outerAng = atanf(DistortRadius(outerD / toLens, v.k1, v.k2));
+        float innerAng = atanf(DistortRadius(innerD / toLens, v.k1, v.k2));
+        float botAng = atanf(DistortRadius(bottomD / toLens, v.k1, v.k2));
+        float topAng = atanf(DistortRadius(topD / toLens, v.k1, v.k2));
+
+        float fL = std::min(outerAng, v.maxFovDeg[0] * deg2rad);
+        float fR = std::min(innerAng, v.maxFovDeg[1] * deg2rad);
+        float fB = std::min(botAng, v.maxFovDeg[2] * deg2rad);
+        float fT = std::min(topAng, v.maxFovDeg[3] * deg2rad);
+
+        return (eye == 0) ? simd_make_float4(fL, fR, fB, fT) : simd_make_float4(fR, fL, fB, fT);
+    }
+
+    static CGPoint TextureUvToScreenUv(CGPoint texUv, int eye, const CardboardViewerParams &v, float screenW, float screenH, simd_float4 fov)
+    {
+        float toLens = std::max(0.01f, v.screenToLensDistance);
+        float eyeCenterM = (eye == 0) ? ((screenW - v.interLensDistance) * 0.5f) : ((screenW + v.interLensDistance) * 0.5f);
+        float scrW = screenW / toLens;
+        float scrH = screenH / toLens;
+        float scrOx = eyeCenterM / toLens;
+        float scrOy = GetEyeOffsetYMeters(v, screenH) / toLens;
+
+        float tanL = tanf(fov.x), tanR = tanf(fov.y), tanB = tanf(fov.z), tanT = tanf(fov.w);
+        float texW = tanL + tanR;
+        float texH = tanB + tanT;
+
+        float tx = static_cast<float>(texUv.x) * texW - tanL;
+        float ty = static_cast<float>(texUv.y) * texH - tanB;
+        float rad = hypotf(tx, ty);
+        float scale = (rad > 1e-6f) ? (DistortInverseRadius(rad, v.k1, v.k2) / rad) : 0.0f;
+        float ux = tx * scale;
+        float uy = ty * scale;
+
+        return CGPointMake((ux + scrOx) / scrW, (uy + scrOy) / scrH);
+    }
+
+    static SCNMatrix4 MakeFrustumMatrix(simd_float4 fov, float nearZ, float farZ)
+    {
+        float l = -tanf(fov.x) * nearZ;
+        float r = tanf(fov.y) * nearZ;
+        float b = -tanf(fov.z) * nearZ;
+        float t = tanf(fov.w) * nearZ;
+
+        SCNMatrix4 m = SCNMatrix4Identity;
+        m.m11 = (2.0f * nearZ) / (r - l);
+        m.m22 = (2.0f * nearZ) / (t - b);
+        m.m31 = (r + l) / (r - l);
+        m.m32 = (t + b) / (t - b);
+        m.m33 = -(farZ + nearZ) / (farZ - nearZ);
+        m.m34 = -1.0f;
+        m.m43 = -(2.0f * farZ * nearZ) / (farZ - nearZ);
+        m.m44 = 0.0f;
+        return m;
+    }
+
+    // Converts CoreMotion device attitude into SceneKit camera orientation matrix (R_scn_from_cam).
+    static simd_quatf CoreMotionToSceneKitOrientation(CMDeviceMotion *motion, UIInterfaceOrientation orient)
+    {
+        CMRotationMatrix rm = motion.attitude.rotationMatrix;
+        // Rows of CMRotationMatrix represent ref->dev in CoreMotion; transpose gives R_ref_from_dev (columns are dev axes in ref).
+        simd_float3 colX = simd_make_float3(static_cast<float>(rm.m11), static_cast<float>(rm.m12), static_cast<float>(rm.m13));
+        simd_float3 colY = simd_make_float3(static_cast<float>(rm.m21), static_cast<float>(rm.m22), static_cast<float>(rm.m23));
+        simd_float3 colZ = simd_make_float3(static_cast<float>(rm.m31), static_cast<float>(rm.m32), static_cast<float>(rm.m33));
+        simd_float3x3 R_ref_from_dev(colX, colY, colZ);
+
+        // Validate against gravity vector: ref down (0,0,-1) mapped into dev by R_dev_from_ref should match motion.gravity.
+        simd_float3 gravDev = simd_make_float3(static_cast<float>(motion.gravity.x),
+                                              static_cast<float>(motion.gravity.y),
+                                              static_cast<float>(motion.gravity.z));
+        simd_float3 downTestA = simd_mul(simd_transpose(R_ref_from_dev), simd_make_float3(0.0f, 0.0f, -1.0f));
+        simd_float3 downTestB = simd_mul(R_ref_from_dev, simd_make_float3(0.0f, 0.0f, -1.0f));
+        if (simd_dot(downTestB, gravDev) > simd_dot(downTestA, gravDev))
+            R_ref_from_dev = simd_transpose(R_ref_from_dev);
+
+        // Screen camera axes expressed in device coordinates (LandscapeLeft vs LandscapeRight)
+        simd_float3x3 R_dev_from_cam = (orient == UIInterfaceOrientationLandscapeRight)
+            ? simd_float3x3(simd_make_float3(0, -1, 0), simd_make_float3(1, 0, 0), simd_make_float3(0, 0, 1))
+            : simd_float3x3(simd_make_float3(0, 1, 0), simd_make_float3(-1, 0, 0), simd_make_float3(0, 0, 1));
+
+        // SceneKit world from CoreMotion reference frame: X_scn = X_ref, Y_scn = Z_ref, Z_scn = -Y_ref
+        simd_float3x3 R_scn_from_ref(simd_make_float3(1, 0, 0),
+                                     simd_make_float3(0, 0, -1),
+                                     simd_make_float3(0, 1, 0));
+
+        simd_float3x3 R_scn_from_cam = simd_mul(R_scn_from_ref, simd_mul(R_ref_from_dev, R_dev_from_cam));
+        simd_quatf q = simd_quaternion(R_scn_from_cam);
+
+        // Apply 14 ms gyroscopic angular-velocity lead to minimize motion-to-photon latency at 120 Hz.
+        CMRotationRate rr = motion.rotationRate;
+        simd_float3 wDev = simd_make_float3(static_cast<float>(rr.x), static_cast<float>(rr.y), static_cast<float>(rr.z));
+        simd_float3 wCam = simd_mul(simd_transpose(R_dev_from_cam), wDev);
+        float wMag = simd_length(wCam);
+        if (wMag > 1e-3f)
+        {
+            float predAngle = std::min(0.25f, wMag * 0.014f);
+            simd_quatf dq = simd_quaternion(predAngle, wCam / wMag);
+            q = simd_mul(q, dq);
+        }
+        return simd_normalize(q);
+    }
 }
 
-@interface VRWorkspaceViewController () <ARSessionDelegate>
+@interface VRWorkspaceViewController () <ARSessionDelegate, SCNSceneRendererDelegate>
 @property (nonatomic, strong) ARSession *arSession;
+@property (nonatomic, strong) CMMotionManager *motionManager;
+@property (nonatomic, strong) SCNView *compositorView;
+@property (nonatomic, strong) SCNScene *compositorScene;
+@property (nonatomic, strong) SCNNode *compositorCamNode;
+@property (nonatomic, strong) SCNNode *leftDistortionNode;
+@property (nonatomic, strong) SCNNode *rightDistortionNode;
+@property (nonatomic, strong) SCNNode *alignmentMarkerNode;
+@property (nonatomic, strong) id<MTLDevice> mtlDevice;
+@property (nonatomic, strong) id<MTLCommandQueue> mtlQueue;
+
 @property (nonatomic, strong) SCNScene *scene;
-@property (nonatomic, strong) SCNView *leftView;
-@property (nonatomic, strong) SCNView *rightView;
 @property (nonatomic, strong) SCNNode *headNode;
 @property (nonatomic, strong) SCNNode *leftEyeNode;
 @property (nonatomic, strong) SCNNode *rightEyeNode;
+@property (nonatomic, strong) SCNNode *centerEyeNode;
+@property (nonatomic, strong) SCNNode *gazeDotNode;
 @property (nonatomic, strong) SCNNode *cinemaRootNode;
+@property (nonatomic, strong) SCNNode *envGroupNode;
 @property (nonatomic, strong) SCNNode *screenAnchorNode;
 @property (nonatomic, strong) SCNNode *parsecScreenNode;
 @property (nonatomic, strong) SCNNode *parsecPanelNode;
 @property (nonatomic, strong) SCNNode *parsecBarNode;
 @property (nonatomic, strong) SCNNode *parsecCursorNode;
-@property (nonatomic, strong) SCNNode *floorNode;
 
-@property (nonatomic, strong) UIView *dividerLine;
-@property (nonatomic, strong) UIView *leftReticle;
-@property (nonatomic, strong) UIView *rightReticle;
 @property (nonatomic, strong) UIButton *quickSetupButton;
 @property (nonatomic, strong) UIButton *viewModeButton;
 @property (nonatomic, strong) CADisplayLink *displayLink;
@@ -162,20 +323,25 @@ namespace
 @property (nonatomic, strong) NSArray<NSDictionary *> *hosts;
 @property (nonatomic, assign) int hostWidth;
 @property (nonatomic, assign) int hostHeight;
-@property (nonatomic, assign) LoginField loginField;
 
-// VR Box optical & cinema settings
-@property (nonatomic, assign) float lensSpacingRatio;
-@property (nonatomic, assign) float eyeHeightRatio;
+// VR BOX QR distortion & cinema parameters
 @property (nonatomic, assign) float screenScale;
 @property (nonatomic, assign) float screenDistance;
+@property (nonatomic, assign) float screenMetersW;
+@property (nonatomic, assign) float screenMetersH;
+@property (nonatomic, assign) int envMode; // 0 = 3D VR Cyber Cinema, 1 = Pure Black, 2 = Camera Passthrough
+@property (nonatomic, assign) BOOL sixDofEnabled;
 @property (nonatomic, assign) BOOL headLockMode;
-@property (nonatomic, assign) BOOL passthroughOn;
 @property (nonatomic, assign) BOOL passthroughBusy;
 @property (nonatomic, assign) CFTimeInterval nextPassthroughAt;
 @property (nonatomic, assign) BOOL singleScreenTouchMode;
 @property (nonatomic, assign) BOOL muted;
 @property (nonatomic, assign) BOOL hasRecenteredOnce;
+@property (nonatomic, assign) float yawOffsetRad;
+@property (nonatomic, assign) BOOL yawInitialized;
+@property (nonatomic, assign) simd_float3 arHeadOffset;
+@property (nonatomic, assign) BOOL hasArPosition;
+@property (nonatomic, assign) simd_float3 arHeadPos;
 
 // Xbox / MFi Controller state
 @property (nonatomic, strong) GCController *activeController;
@@ -201,7 +367,6 @@ namespace
 @property (nonatomic, assign) uint8_t lastSentLT;
 @property (nonatomic, assign) uint8_t lastSentRT;
 
-// Edge-trigger memory for UI / mouse mode controller buttons
 @property (nonatomic, assign) BOOL prevBtnA;
 @property (nonatomic, assign) BOOL prevBtnB;
 @property (nonatomic, assign) BOOL prevBtnX;
@@ -222,6 +387,13 @@ namespace
 
 @implementation VRWorkspaceViewController
 {
+    CardboardViewerParams _viewer;
+    SCNRenderer *_eyeRenderers[2];
+    id<MTLTexture> _eyeColorTex[2];
+    id<MTLTexture> _eyeDepthTex[2];
+    int _eyeTexW;
+    int _eyeTexH;
+    CGSize _lastLayoutSize;
     std::vector<VRButtonHit> _parsecPanelHits;
     std::vector<VRButtonHit> _parsecBarHits;
 }
@@ -245,32 +417,34 @@ namespace
     self.hosts = @[];
     self.hostWidth = 1920;
     self.hostHeight = 1080;
-    self.loginField = LoginField::Email;
     self.cursorUv = CGPointMake(0.5, 0.5);
     self.lastMousePx = -1;
     self.lastMousePy = -1;
     self.heldMouseButton = 1;
     self.selectedMenuIndex = 0;
 
+    // Initialize default VR BOX QR parameters + saved preferences
+    _viewer = CardboardViewerParams{};
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    float savedLens = [ud floatForKey:kPrefLensSpacing];
-    float savedEyeH = [ud floatForKey:kPrefEyeHeight];
+    float savedIpd = [ud floatForKey:kPrefQrInterLens];
     float savedScale = [ud floatForKey:kPrefScreenScale];
     float savedDist = [ud floatForKey:kPrefScreenDist];
-    self.lensSpacingRatio = (savedLens >= 0.28f && savedLens <= 0.50f) ? savedLens : kDefaultLensSpacing;
-    self.eyeHeightRatio = (savedEyeH >= 0.65f && savedEyeH <= 1.00f) ? savedEyeH : kDefaultEyeHeight;
+    if (savedIpd >= 0.050f && savedIpd <= 0.075f)
+        _viewer.interLensDistance = savedIpd;
     self.screenScale = (savedScale >= 0.60f && savedScale <= 2.40f) ? savedScale : kDefaultScreenScale;
-    self.screenDistance = (savedDist >= 0.80f && savedDist <= 2.60f) ? savedDist : kDefaultScreenDist;
+    self.screenDistance = (savedDist >= 0.85f && savedDist <= 2.60f) ? savedDist : kDefaultScreenDist;
 
-    self.passthroughOn = NO; // Cinema Black gives razor-sharp contrast and ice-cold 120 FPS.
-    self.headLockMode = NO;  // World 6DoF locked by default; Y button recenters anytime.
+    self.envMode = 0;      // 3D 120 FPS VR Cinema environment enabled by default
+    self.sixDofEnabled = YES;
+    self.headLockMode = NO;
 
     self.ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
     self.passthroughQueue = dispatch_queue_create("com.brenpoly.cardboardxr.passthrough", DISPATCH_QUEUE_SERIAL);
 
-    [self setupSceneAndStereoViews];
-    [self buildCinemaNodes];
-    [self setupOverlayViews];
+    [self setupSceneAndCardboardCompositor];
+    [self buildCinemaAndEnvironment];
+    [self setupOverlayButtons];
+    [self setupCoreMotion120Hz];
     [self setupArSession];
     [self setupGameControllers];
 
@@ -279,6 +453,7 @@ namespace
     [self restoreSavedSession];
     [self applyScreenLayoutAndScale];
     [self applyWorkspaceVisibility];
+    [self rebuildCardboardDistortionRig];
     [self redrawAllPanels];
 
     self.lastTickAt = CACurrentMediaTime();
@@ -290,9 +465,11 @@ namespace
 
 - (void)dealloc
 {
-    [[NSNotificationCenter defaultCenter] removeObserver:self];
     [self.displayLink invalidate];
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [self.motionManager stopDeviceMotionUpdates];
     [self.arSession pause];
+    self.compositorView.delegate = nil;
     VRParsecUnplugGamepad();
     VRParsecDisconnect();
 }
@@ -300,117 +477,241 @@ namespace
 - (void)viewDidLayoutSubviews
 {
     [super viewDidLayoutSubviews];
-    [self updateStereoOrFullLayout];
-}
-
-#pragma mark - VR Box Optical Viewport Layout
-
-- (void)saveVrBoxPreferences
-{
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    [ud setFloat:self.lensSpacingRatio forKey:kPrefLensSpacing];
-    [ud setFloat:self.eyeHeightRatio forKey:kPrefEyeHeight];
-    [ud setFloat:self.screenScale forKey:kPrefScreenScale];
-    [ud setFloat:self.screenDistance forKey:kPrefScreenDist];
-}
-
-- (void)updateStereoOrFullLayout
-{
     CGRect bounds = self.view.bounds;
-    CGFloat W = bounds.size.width;
-    CGFloat H = bounds.size.height;
-    if (W <= 0 || H <= 0)
-        return;
-
-    if (self.singleScreenTouchMode)
+    self.compositorView.frame = bounds;
+    if (!CGSizeEqualToSize(bounds.size, _lastLayoutSize) && bounds.size.width > 0 && bounds.size.height > 0)
     {
-        self.leftView.frame = bounds;
-        self.rightView.hidden = YES;
-        self.rightView.rendersContinuously = NO;
-        self.dividerLine.hidden = YES;
-        self.leftReticle.hidden = YES;
-        self.rightReticle.hidden = YES;
-        self.quickSetupButton.alpha = 0.92;
-        self.viewModeButton.alpha = 0.92;
-        return;
+        _lastLayoutSize = bounds.size;
+        [self rebuildCardboardDistortionRig];
+    }
+}
+
+#pragma mark - Physical Metrics & Cardboard QR Distortion Rig
+
+- (void)updatePhysicalScreenMeters
+{
+    CGRect nb = [UIScreen mainScreen].nativeBounds;
+    float pxW = static_cast<float>(MAX(nb.size.width, nb.size.height));
+    float pxH = static_cast<float>(MIN(nb.size.width, nb.size.height));
+    float scale = static_cast<float>([UIScreen mainScreen].nativeScale);
+    float ppi = (scale >= 2.9f) ? ((pxW <= 2400.0f) ? 476.0f : 460.0f) : 326.0f;
+    self.screenMetersW = std::max(0.08f, (pxW / ppi) * kMetersPerInch);
+    self.screenMetersH = std::max(0.04f, (pxH / ppi) * kMetersPerInch);
+}
+
+- (SCNGeometry *)createDistortionGeometryForEye:(int)eye
+                                         aspect:(float)screenAspect
+                                            fov:(simd_float4)fov
+{
+    const int n = kMeshResolution;
+    std::vector<SCNVector3> vertices(n * n);
+    std::vector<CGPoint> texcoords(n * n);
+
+    for (int row = 0; row < n; ++row)
+    {
+        float vBottomUp = static_cast<float>(row) / static_cast<float>(n - 1);
+        for (int col = 0; col < n; ++col)
+        {
+            float u = static_cast<float>(col) / static_cast<float>(n - 1);
+            CGPoint scrUv = TextureUvToScreenUv(CGPointMake(u, vBottomUp), eye, _viewer, self.screenMetersW, self.screenMetersH, fov);
+            int idx = row * n + col;
+            float xPos = (2.0f * static_cast<float>(scrUv.x) - 1.0f) * screenAspect;
+            float yPos = 2.0f * static_cast<float>(scrUv.y) - 1.0f;
+            vertices[idx] = SCNVector3Make(xPos, yPos, 0.0f);
+            // Invert V because SCNRenderer writes into Metal texture top-down (row 0 = top).
+            texcoords[idx] = CGPointMake(u, 1.0f - vBottomUp);
+        }
     }
 
-    self.rightView.hidden = NO;
-    self.rightView.rendersContinuously = YES;
-    self.dividerLine.hidden = NO;
+    std::vector<int32_t> indices((n - 1) * (n - 1) * 6);
+    int t = 0;
+    for (int row = 0; row < n - 1; ++row)
+    {
+        for (int col = 0; col < n - 1; ++col)
+        {
+            int idx = row * n + col;
+            indices[t++] = idx;
+            indices[t++] = idx + n;
+            indices[t++] = idx + 1;
+            indices[t++] = idx + 1;
+            indices[t++] = idx + n;
+            indices[t++] = idx + n + 1;
+        }
+    }
 
-    CGFloat midX = W * 0.5;
-    CGFloat eyeW = floor(W * self.lensSpacingRatio);
-    CGFloat eyeH = floor(H * self.eyeHeightRatio);
-    CGFloat eyeY = floor((H - eyeH) * 0.5);
-
-    self.leftView.frame = CGRectMake(midX - eyeW - 1.0, eyeY, eyeW, eyeH);
-    self.rightView.frame = CGRectMake(midX + 1.0, eyeY, eyeW, eyeH);
-    self.dividerLine.frame = CGRectMake(midX - 0.5, 0.0, 1.0, H);
-
-    BOOL showReticles = !self.parsecConnected;
-    self.leftReticle.hidden = !showReticles;
-    self.rightReticle.hidden = !showReticles;
-
-    CGFloat rSize = 8.0;
-    self.leftReticle.center = CGPointMake(midX - 1.0 - eyeW * 0.5, H * 0.5);
-    self.leftReticle.bounds = CGRectMake(0, 0, rSize, rSize);
-    self.rightReticle.center = CGPointMake(midX + 1.0 + eyeW * 0.5, H * 0.5);
-    self.rightReticle.bounds = CGRectMake(0, 0, rSize, rSize);
-
-    // Subtle in VR Box so corners stay clean behind lens edge.
-    self.quickSetupButton.alpha = 0.28;
-    self.viewModeButton.alpha = 0.28;
+    SCNGeometrySource *posSrc = [SCNGeometrySource geometrySourceWithVertices:vertices.data() count:static_cast<NSInteger>(vertices.size())];
+    SCNGeometrySource *uvSrc = [SCNGeometrySource geometrySourceWithTextureCoordinates:texcoords.data() count:static_cast<NSInteger>(texcoords.size())];
+    NSData *idxData = [NSData dataWithBytes:indices.data() length:indices.size() * sizeof(int32_t)];
+    SCNGeometryElement *elem = [SCNGeometryElement geometryElementWithData:idxData
+                                                             primitiveType:SCNGeometryPrimitiveTypeTriangles
+                                                            primitiveCount:static_cast<NSInteger>(indices.size() / 3)
+                                                             bytesPerIndex:sizeof(int32_t)];
+    return [SCNGeometry geometryWithSources:@[posSrc, uvSrc] elements:@[elem]];
 }
 
-#pragma mark - Scene & Cinema Nodes
+- (void)ensureEyeRenderTargetsForWidth:(int)w height:(int)h
+{
+    if (_eyeTexW == w && _eyeTexH == h && _eyeColorTex[0] != nil && _eyeColorTex[1] != nil)
+        return;
 
-- (void)setupSceneAndStereoViews
+    _eyeTexW = w;
+    _eyeTexH = h;
+
+    for (int eye = 0; eye < 2; ++eye)
+    {
+        MTLTextureDescriptor *cDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB
+                                                                                         width:static_cast<NSUInteger>(w)
+                                                                                        height:static_cast<NSUInteger>(h)
+                                                                                     mipmapped:NO];
+        cDesc.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead;
+        cDesc.storageMode = MTLStorageModePrivate;
+        _eyeColorTex[eye] = [self.mtlDevice newTextureWithDescriptor:cDesc];
+
+        MTLTextureDescriptor *dDesc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+                                                                                         width:static_cast<NSUInteger>(w)
+                                                                                        height:static_cast<NSUInteger>(h)
+                                                                                     mipmapped:NO];
+        dDesc.usage = MTLTextureUsageRenderTarget;
+        dDesc.storageMode = MTLStorageModePrivate;
+        _eyeDepthTex[eye] = [self.mtlDevice newTextureWithDescriptor:dDesc];
+    }
+}
+
+- (void)rebuildCardboardDistortionRig
+{
+    [self updatePhysicalScreenMeters];
+
+    CGRect bounds = self.view.bounds;
+    float viewW = std::max(1.0f, static_cast<float>(bounds.size.width));
+    float viewH = std::max(1.0f, static_cast<float>(bounds.size.height));
+    float screenAspect = viewW / viewH;
+
+    CGRect nb = [UIScreen mainScreen].nativeBounds;
+    int eyeW = std::max(512, static_cast<int>(MAX(nb.size.width, nb.size.height) * 0.5));
+    int eyeH = std::max(512, static_cast<int>(MIN(nb.size.width, nb.size.height)));
+    [self ensureEyeRenderTargetsForWidth:eyeW height:eyeH];
+
+    simd_float4 fovL = ComputeEyeFov(0, _viewer, self.screenMetersW, self.screenMetersH);
+    simd_float4 fovR = ComputeEyeFov(1, _viewer, self.screenMetersW, self.screenMetersH);
+    self.leftEyeNode.camera.projectionTransform = MakeFrustumMatrix(fovL, 0.05f, 60.0f);
+    self.rightEyeNode.camera.projectionTransform = MakeFrustumMatrix(fovR, 0.05f, 60.0f);
+
+    float halfIpd = (self.envMode == 2) ? 0.0f : (_viewer.interLensDistance * 0.5f);
+    self.leftEyeNode.position = SCNVector3Make(-halfIpd, 0.0f, 0.0f);
+    self.rightEyeNode.position = SCNVector3Make(halfIpd, 0.0f, 0.0f);
+
+    for (int eye = 0; eye < 2; ++eye)
+    {
+        SCNGeometry *geo = [self createDistortionGeometryForEye:eye aspect:screenAspect fov:(eye == 0 ? fovL : fovR)];
+        SCNMaterial *mat = [SCNMaterial material];
+        mat.lightingModelName = SCNLightingModelConstant;
+        mat.diffuse.contents = _eyeColorTex[eye];
+        mat.diffuse.wrapS = SCNWrapModeClamp;
+        mat.diffuse.wrapT = SCNWrapModeClamp;
+        mat.doubleSided = YES;
+        mat.writesToDepthBuffer = NO;
+        mat.readsFromDepthBuffer = NO;
+        geo.materials = @[mat];
+
+        SCNNode *node = (eye == 0) ? self.leftDistortionNode : self.rightDistortionNode;
+        node.geometry = geo;
+    }
+
+    // Rebuild bottom Cardboard alignment marker (2 dp wide, 24 mm tall)
+    float markerHNorm = std::min(0.45f, 0.024f / self.screenMetersH);
+    float markerWNorm = std::max(0.002f, 2.0f / viewW);
+    SCNPlane *mkPlane = [SCNPlane planeWithWidth:(markerWNorm * 2.0f * screenAspect) height:(markerHNorm * 2.0f)];
+    SCNMaterial *mkMat = [SCNMaterial material];
+    mkMat.lightingModelName = SCNLightingModelConstant;
+    mkMat.diffuse.contents = ColorHex(0xB4B4B4, 0.85);
+    mkMat.writesToDepthBuffer = NO;
+    mkMat.readsFromDepthBuffer = NO;
+    mkPlane.materials = @[mkMat];
+    self.alignmentMarkerNode.geometry = mkPlane;
+    self.alignmentMarkerNode.position = SCNVector3Make(0.0f, -1.0f + markerHNorm, 0.01f);
+}
+
+#pragma mark - SceneKit Setup & 120 FPS Compositor
+
+- (void)setupSceneAndCardboardCompositor
 {
     self.scene = [SCNScene scene];
-    self.scene.background.contents = [UIColor blackColor];
+    self.scene.background.contents = ColorHex(0x06070D);
 
     self.headNode = [SCNNode node];
     [self.scene.rootNode addChildNode:self.headNode];
 
-    // Zero-disparity MonoEyes optical axis prevents double vision on flat cinema screen inside VR Box lenses.
     SCNCamera *leftCam = [SCNCamera camera];
-    leftCam.zNear = 0.05;
-    leftCam.zFar = 50.0;
-    leftCam.fieldOfView = kDefaultFov;
     self.leftEyeNode = [SCNNode node];
     self.leftEyeNode.camera = leftCam;
-    self.leftEyeNode.position = SCNVector3Zero;
     [self.headNode addChildNode:self.leftEyeNode];
 
     SCNCamera *rightCam = [SCNCamera camera];
-    rightCam.zNear = 0.05;
-    rightCam.zFar = 50.0;
-    rightCam.fieldOfView = kDefaultFov;
     self.rightEyeNode = [SCNNode node];
     self.rightEyeNode.camera = rightCam;
-    self.rightEyeNode.position = SCNVector3Zero;
     [self.headNode addChildNode:self.rightEyeNode];
 
-    self.leftView = [[SCNView alloc] initWithFrame:CGRectZero];
-    self.leftView.scene = self.scene;
-    self.leftView.pointOfView = self.leftEyeNode;
-    self.leftView.backgroundColor = [UIColor blackColor];
-    self.leftView.antialiasingMode = SCNAntialiasingModeNone;
-    self.leftView.preferredFramesPerSecond = 120;
-    self.leftView.rendersContinuously = YES;
-    self.leftView.userInteractionEnabled = NO;
-    [self.view addSubview:self.leftView];
+    SCNCamera *centerCam = [SCNCamera camera];
+    centerCam.zNear = 0.05;
+    centerCam.zFar = 60.0;
+    centerCam.fieldOfView = 72.0;
+    self.centerEyeNode = [SCNNode node];
+    self.centerEyeNode.camera = centerCam;
+    [self.headNode addChildNode:self.centerEyeNode];
 
-    self.rightView = [[SCNView alloc] initWithFrame:CGRectZero];
-    self.rightView.scene = self.scene;
-    self.rightView.pointOfView = self.rightEyeNode;
-    self.rightView.backgroundColor = [UIColor blackColor];
-    self.rightView.antialiasingMode = SCNAntialiasingModeNone;
-    self.rightView.preferredFramesPerSecond = 120;
-    self.rightView.rendersContinuously = YES;
-    self.rightView.userInteractionEnabled = NO;
-    [self.view addSubview:self.rightView];
+    SCNSphere *gGeo = [SCNSphere sphereWithRadius:0.009];
+    SCNMaterial *gMat = [SCNMaterial material];
+    gMat.lightingModelName = SCNLightingModelConstant;
+    gMat.diffuse.contents = ColorHex(0x5EEAD4, 0.90);
+    gMat.writesToDepthBuffer = NO;
+    gGeo.materials = @[gMat];
+    self.gazeDotNode = [SCNNode nodeWithGeometry:gGeo];
+    self.gazeDotNode.position = SCNVector3Make(0, 0, -1.25f);
+    self.gazeDotNode.renderingOrder = 30;
+    [self.headNode addChildNode:self.gazeDotNode];
+
+    // Primary full-screen 120 FPS Metal compositor SCNView
+    self.compositorView = [[SCNView alloc] initWithFrame:self.view.bounds options:@{SCNPreferredRenderingAPIKey: @(SCNRenderingAPIMetal)}];
+    self.compositorView.backgroundColor = [UIColor blackColor];
+    self.compositorView.antialiasingMode = SCNAntialiasingModeNone;
+    self.compositorView.preferredFramesPerSecond = 120;
+    self.compositorView.rendersContinuously = YES;
+    self.compositorView.delegate = self;
+    self.compositorView.userInteractionEnabled = NO;
+    [self.view addSubview:self.compositorView];
+
+    self.mtlDevice = self.compositorView.device ?: MTLCreateSystemDefaultDevice();
+    self.mtlQueue = self.compositorView.commandQueue ?: [self.mtlDevice newCommandQueue];
+
+    for (int eye = 0; eye < 2; ++eye)
+    {
+        _eyeRenderers[eye] = [SCNRenderer rendererWithDevice:self.mtlDevice options:nil];
+        _eyeRenderers[eye].scene = self.scene;
+        _eyeRenderers[eye].pointOfView = (eye == 0) ? self.leftEyeNode : self.rightEyeNode;
+    }
+
+    self.compositorScene = [SCNScene scene];
+    self.compositorScene.background.contents = [UIColor blackColor];
+
+    SCNCamera *compCam = [SCNCamera camera];
+    compCam.usesOrthographicProjection = YES;
+    compCam.orthographicScale = 1.0;
+    compCam.zNear = 0.01;
+    compCam.zFar = 10.0;
+    self.compositorCamNode = [SCNNode node];
+    self.compositorCamNode.camera = compCam;
+    self.compositorCamNode.position = SCNVector3Make(0, 0, 1.0);
+    [self.compositorScene.rootNode addChildNode:self.compositorCamNode];
+
+    self.leftDistortionNode = [SCNNode node];
+    self.rightDistortionNode = [SCNNode node];
+    self.alignmentMarkerNode = [SCNNode node];
+    [self.compositorScene.rootNode addChildNode:self.leftDistortionNode];
+    [self.compositorScene.rootNode addChildNode:self.rightDistortionNode];
+    [self.compositorScene.rootNode addChildNode:self.alignmentMarkerNode];
+
+    self.compositorView.scene = self.compositorScene;
+    self.compositorView.pointOfView = self.compositorCamNode;
 }
 
 - (SCNNode *)makePlaneNode:(NSString *)name width:(CGFloat)w height:(CGFloat)h color:(UIColor *)color
@@ -435,27 +736,81 @@ namespace
     return [[UIGraphicsImageRenderer alloc] initWithSize:sz format:fmt];
 }
 
-- (void)buildCinemaNodes
+- (UIImage *)createCyberGridImage:(UIColor *)lineColor bgColor:(UIColor *)bgColor
+{
+    CGSize sz = CGSizeMake(256, 256);
+    UIGraphicsImageRenderer *r = [self makeUiRendererWithSize:sz];
+    return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [bgColor setFill];
+        [ctx fillRect:CGRectMake(0, 0, 256, 256)];
+        [lineColor setFill];
+        [ctx fillRect:CGRectMake(0, 0, 256, 3)];
+        [ctx fillRect:CGRectMake(0, 0, 3, 256)];
+    }];
+}
+
+- (void)buildCinemaAndEnvironment
 {
     self.cinemaRootNode = [SCNNode node];
     [self.scene.rootNode addChildNode:self.cinemaRootNode];
 
-    SCNPlane *floorGeo = [SCNPlane planeWithWidth:20.0 height:20.0];
+    // Lightweight 120 FPS constant-shaded 3D cyber theater environment
+    self.envGroupNode = [SCNNode node];
+    [self.cinemaRootNode addChildNode:self.envGroupNode];
+
+    SCNPlane *floorGeo = [SCNPlane planeWithWidth:24.0 height:24.0];
     SCNMaterial *floorMat = [SCNMaterial material];
     floorMat.lightingModelName = SCNLightingModelConstant;
-    floorMat.diffuse.contents = ColorHex(0x060609);
+    floorMat.diffuse.contents = [self createCyberGridImage:ColorHex(0x2F4670, 0.72) bgColor:ColorHex(0x06070D)];
+    floorMat.diffuse.wrapS = SCNWrapModeRepeat;
+    floorMat.diffuse.wrapT = SCNWrapModeRepeat;
+    floorMat.diffuse.contentsTransform = SCNMatrix4MakeScale(24, 24, 1);
     floorGeo.materials = @[floorMat];
-    self.floorNode = [SCNNode nodeWithGeometry:floorGeo];
-    self.floorNode.position = SCNVector3Make(0, -1.75f, 0);
-    self.floorNode.eulerAngles = SCNVector3Make(-M_PI_2, 0, 0);
-    self.floorNode.hidden = YES;
-    [self.cinemaRootNode addChildNode:self.floorNode];
+    SCNNode *floorNode = [SCNNode nodeWithGeometry:floorGeo];
+    floorNode.position = SCNVector3Make(0, -1.65f, 0);
+    floorNode.eulerAngles = SCNVector3Make(static_cast<float>(-M_PI_2), 0, 0);
+    [self.envGroupNode addChildNode:floorNode];
+
+    SCNPlane *ceilGeo = [SCNPlane planeWithWidth:24.0 height:24.0];
+    SCNMaterial *ceilMat = [SCNMaterial material];
+    ceilMat.lightingModelName = SCNLightingModelConstant;
+    ceilMat.diffuse.contents = [self createCyberGridImage:ColorHex(0x262040, 0.48) bgColor:ColorHex(0x06070D)];
+    ceilMat.diffuse.wrapS = SCNWrapModeRepeat;
+    ceilMat.diffuse.wrapT = SCNWrapModeRepeat;
+    ceilMat.diffuse.contentsTransform = SCNMatrix4MakeScale(20, 20, 1);
+    ceilGeo.materials = @[ceilMat];
+    SCNNode *ceilNode = [SCNNode nodeWithGeometry:ceilGeo];
+    ceilNode.position = SCNVector3Make(0, 2.95f, 0);
+    ceilNode.eulerAngles = SCNVector3Make(static_cast<float>(M_PI_2), 0, 0);
+    [self.envGroupNode addChildNode:ceilNode];
+
+    SCNTorus *ring1 = [SCNTorus torusWithRingRadius:5.8 pipeRadius:0.015];
+    SCNMaterial *ringMat = [SCNMaterial material];
+    ringMat.lightingModelName = SCNLightingModelConstant;
+    ringMat.diffuse.contents = ColorHex(0x6D56A8, 0.55);
+    ring1.materials = @[ringMat];
+    SCNNode *ringNode = [SCNNode nodeWithGeometry:ring1];
+    ringNode.position = SCNVector3Make(0, -1.60f, 0);
+    [self.envGroupNode addChildNode:ringNode];
+
+    SCNBox *pillarGeo = [SCNBox boxWithWidth:0.12 height:4.6 length:0.12 chamferRadius:0.02];
+    SCNMaterial *pillarMat = [SCNMaterial material];
+    pillarMat.lightingModelName = SCNLightingModelConstant;
+    pillarMat.diffuse.contents = ColorHex(0x161B2E);
+    pillarGeo.materials = @[pillarMat];
+    for (int i = 0; i < 8; ++i)
+    {
+        float ang = static_cast<float>(i) * (static_cast<float>(M_PI) * 0.25f) + 0.39f;
+        SCNNode *p = [SCNNode nodeWithGeometry:pillarGeo];
+        p.position = SCNVector3Make(sinf(ang) * 5.6f, 0.65f, cosf(ang) * 5.6f);
+        [self.envGroupNode addChildNode:p];
+    }
 
     self.screenAnchorNode = [SCNNode node];
     self.screenAnchorNode.position = SCNVector3Make(0, 0.0f, -self.screenDistance);
     [self.cinemaRootNode addChildNode:self.screenAnchorNode];
 
-    self.parsecScreenNode = [self makePlaneNode:@"parsec_screen" width:kBaseScreenWidth height:(kBaseScreenWidth * 9.0 / 16.0) color:ColorHex(0x101014)];
+    self.parsecScreenNode = [self makePlaneNode:@"parsec_screen" width:kBaseScreenWidth height:(kBaseScreenWidth * 9.0 / 16.0) color:ColorHex(0x0E0F14)];
     [self.screenAnchorNode addChildNode:self.parsecScreenNode];
 
     self.parsecPanelNode = [self makePlaneNode:@"parsec_panel" width:1.36 height:0.96 color:ColorHex(0x1D1B22)];
@@ -477,53 +832,50 @@ namespace
     [self.parsecScreenNode addChildNode:self.parsecCursorNode];
 }
 
-- (void)setupOverlayViews
+- (void)setupOverlayButtons
 {
-    self.dividerLine = [[UIView alloc] initWithFrame:CGRectZero];
-    self.dividerLine.backgroundColor = ColorHex(0xFFFFFF, 0.25);
-    self.dividerLine.userInteractionEnabled = NO;
-    [self.view addSubview:self.dividerLine];
-
-    auto makeReticle = ^UIView *() {
-        UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 8, 8)];
-        v.layer.cornerRadius = 4.0;
-        v.layer.borderWidth = 1.5;
-        v.layer.borderColor = [UIColor whiteColor].CGColor;
-        v.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.35];
-        v.userInteractionEnabled = NO;
-        return v;
-    };
-    self.leftReticle = makeReticle();
-    self.rightReticle = makeReticle();
-    [self.view addSubview:self.leftReticle];
-    [self.view addSubview:self.rightReticle];
-
     self.quickSetupButton = [UIButton buttonWithType:UIButtonTypeSystem];
     self.quickSetupButton.frame = CGRectMake(14, 14, 140, 32);
-    self.quickSetupButton.backgroundColor = ColorHex(0x2B2930, 0.88);
+    self.quickSetupButton.backgroundColor = ColorHex(0x2B2930, 0.85);
     self.quickSetupButton.layer.cornerRadius = 16;
     [self.quickSetupButton setTitle:@"Parsec Setup" forState:UIControlStateNormal];
     [self.quickSetupButton setTitleColor:ColorHex(0xE6E0E9) forState:UIControlStateNormal];
     self.quickSetupButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
     [self.quickSetupButton addTarget:self action:@selector(openQuickSetupAlert) forControlEvents:UIControlEventTouchUpInside];
+    self.quickSetupButton.alpha = 0.25;
     [self.view addSubview:self.quickSetupButton];
 
     self.viewModeButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.viewModeButton.frame = CGRectMake(162, 14, 130, 32);
-    self.viewModeButton.backgroundColor = ColorHex(0x2B2930, 0.88);
+    self.viewModeButton.frame = CGRectMake(162, 14, 136, 32);
+    self.viewModeButton.backgroundColor = ColorHex(0x2B2930, 0.85);
     self.viewModeButton.layer.cornerRadius = 16;
-    [self.viewModeButton setTitle:@"View: VR Box" forState:UIControlStateNormal];
+    [self.viewModeButton setTitle:@"View: VR Box QR" forState:UIControlStateNormal];
     [self.viewModeButton setTitleColor:ColorHex(0xD0BCFF) forState:UIControlStateNormal];
     self.viewModeButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
     [self.viewModeButton addTarget:self action:@selector(toggleSingleScreenTouchMode) forControlEvents:UIControlEventTouchUpInside];
+    self.viewModeButton.alpha = 0.25;
     [self.view addSubview:self.viewModeButton];
 }
 
 - (void)toggleSingleScreenTouchMode
 {
     self.singleScreenTouchMode = !self.singleScreenTouchMode;
-    [self.viewModeButton setTitle:(self.singleScreenTouchMode ? @"View: Full 2D" : @"View: VR Box") forState:UIControlStateNormal];
-    [self updateStereoOrFullLayout];
+    if (self.singleScreenTouchMode)
+    {
+        self.compositorView.scene = self.scene;
+        self.compositorView.pointOfView = self.centerEyeNode;
+        [self.viewModeButton setTitle:@"View: Full 2D" forState:UIControlStateNormal];
+        self.quickSetupButton.alpha = 0.92;
+        self.viewModeButton.alpha = 0.92;
+    }
+    else
+    {
+        self.compositorView.scene = self.compositorScene;
+        self.compositorView.pointOfView = self.compositorCamNode;
+        [self.viewModeButton setTitle:@"View: VR Box QR" forState:UIControlStateNormal];
+        self.quickSetupButton.alpha = 0.25;
+        self.viewModeButton.alpha = 0.25;
+    }
 }
 
 - (void)applyScreenLayoutAndScale
@@ -544,17 +896,40 @@ namespace
     self.parsecBarNode.position = SCNVector3Make(0, static_cast<float>(barY), 0.02f);
 }
 
-#pragma mark - ARKit 120Hz Head Tracking + Optional Passthrough
+#pragma mark - 120 Hz CoreMotion IMU & ARKit 6DoF Tracking
+
+- (void)setupCoreMotion120Hz
+{
+    self.motionManager = [[CMMotionManager alloc] init];
+    self.motionManager.deviceMotionUpdateInterval = 1.0 / 120.0;
+    if (self.motionManager.isDeviceMotionAvailable)
+    {
+        [self.motionManager startDeviceMotionUpdatesUsingReferenceFrame:CMAttitudeReferenceFrameXArbitraryZVertical];
+    }
+}
 
 - (void)setupArSession
 {
     self.arSession = [[ARSession alloc] init];
     self.arSession.delegate = self;
     self.arSession.delegateQueue = dispatch_get_main_queue();
+    [self syncArSessionState];
+}
 
-    ARWorldTrackingConfiguration *cfg = [[ARWorldTrackingConfiguration alloc] init];
-    cfg.worldAlignment = ARWorldAlignmentGravity;
-    [self.arSession runWithConfiguration:cfg];
+- (void)syncArSessionState
+{
+    BOOL needCamera = self.sixDofEnabled || (self.envMode == 2);
+    if (needCamera)
+    {
+        ARWorldTrackingConfiguration *cfg = [[ARWorldTrackingConfiguration alloc] init];
+        cfg.worldAlignment = ARWorldAlignmentGravity;
+        [self.arSession runWithConfiguration:cfg];
+    }
+    else
+    {
+        [self.arSession pause];
+        self.hasArPosition = NO;
+    }
 }
 
 - (UIInterfaceOrientation)currentInterfaceOrientation
@@ -564,21 +939,51 @@ namespace
     return UIInterfaceOrientationLandscapeLeft;
 }
 
-- (void)session:(ARSession *)session didUpdateFrame:(ARFrame *)frame
+- (void)updateHeadPose120Hz
 {
-    (void)session;
-    UIInterfaceOrientation orient = [self currentInterfaceOrientation];
-    simd_float4x4 viewMat = [frame.camera viewMatrixForOrientation:orient];
-    simd_float4x4 camToWorld = simd_inverse(viewMat);
-    self.headNode.simdTransform = camToWorld;
+    CMDeviceMotion *motion = self.motionManager.deviceMotion;
+    if (motion)
+    {
+        simd_quatf qImu = CoreMotionToSceneKitOrientation(motion, [self currentInterfaceOrientation]);
+        if (!self.yawInitialized)
+        {
+            simd_float3 fwd = simd_act(qImu, simd_make_float3(0.0f, 0.0f, -1.0f));
+            self.yawOffsetRad = -atan2f(fwd.x, -fwd.z);
+            self.yawInitialized = YES;
+        }
+        simd_quatf qYaw = simd_quaternion(self.yawOffsetRad, simd_make_float3(0.0f, 1.0f, 0.0f));
+        self.headNode.simdOrientation = simd_mul(qYaw, qImu);
+    }
 
-    if (!self.hasRecenteredOnce)
+    if (self.sixDofEnabled && self.hasArPosition)
+    {
+        simd_float3 p = self.arHeadPos - self.arHeadOffset;
+        self.headNode.position = SCNVector3Make(p.x, p.y, p.z);
+    }
+    else
+    {
+        self.headNode.position = SCNVector3Zero;
+    }
+
+    if (!self.hasRecenteredOnce && motion)
     {
         self.hasRecenteredOnce = YES;
         [self recenterWorkspace];
     }
+}
 
-    if (self.passthroughOn && !self.passthroughBusy)
+- (void)session:(ARSession *)session didUpdateFrame:(ARFrame *)frame
+{
+    (void)session;
+    if (frame.camera.trackingState == ARTrackingStateNormal)
+    {
+        simd_float4x4 viewMat = [frame.camera viewMatrixForOrientation:[self currentInterfaceOrientation]];
+        simd_float4x4 camToWorld = simd_inverse(viewMat);
+        self.arHeadPos = camToWorld.columns[3].xyz;
+        self.hasArPosition = YES;
+    }
+
+    if (self.envMode == 2 && !self.passthroughBusy)
     {
         CFTimeInterval now = CACurrentMediaTime();
         if (now >= self.nextPassthroughAt)
@@ -586,6 +991,7 @@ namespace
             self.nextPassthroughAt = now + (1.0 / 30.0);
             self.passthroughBusy = YES;
             CVPixelBufferRef pb = CVPixelBufferRetain(frame.capturedImage);
+            UIInterfaceOrientation orient = [self currentInterfaceOrientation];
             __weak VRWorkspaceViewController *weakSelf = self;
             dispatch_async(self.passthroughQueue, ^{
                 VRWorkspaceViewController *strongSelf = weakSelf;
@@ -634,11 +1040,94 @@ namespace
         VRWorkspaceViewController *strongSelf = weakSelf;
         if (strongSelf)
         {
-            if (bg && strongSelf.passthroughOn)
+            if (bg && strongSelf.envMode == 2)
                 strongSelf.scene.background.contents = bg;
             strongSelf.passthroughBusy = NO;
         }
     });
+}
+
+#pragma mark - 120 FPS Dual-Eye Offscreen Render + Distortion Pass
+
+- (void)renderEyesIntoMetalTexturesAtTime:(NSTimeInterval)time
+{
+    if (!_eyeColorTex[0] || !_eyeColorTex[1] || !_eyeDepthTex[0] || !_eyeDepthTex[1])
+        return;
+
+    id<MTLCommandBuffer> cmdBuf = [self.mtlQueue commandBuffer];
+    if (!cmdBuf)
+        return;
+
+    CGRect vp = CGRectMake(0, 0, _eyeTexW, _eyeTexH);
+    for (int eye = 0; eye < 2; ++eye)
+    {
+        MTLRenderPassDescriptor *rpd = [MTLRenderPassDescriptor renderPassDescriptor];
+        rpd.colorAttachments[0].texture = _eyeColorTex[eye];
+        rpd.colorAttachments[0].loadAction = MTLLoadActionClear;
+        rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
+        rpd.colorAttachments[0].clearColor = (self.envMode == 0)
+            ? MTLClearColorMake(0.024, 0.027, 0.051, 1.0)
+            : MTLClearColorMake(0.0, 0.0, 0.0, 1.0);
+
+        rpd.depthAttachment.texture = _eyeDepthTex[eye];
+        rpd.depthAttachment.loadAction = MTLLoadActionClear;
+        rpd.depthAttachment.storeAction = MTLStoreActionDontCare;
+        rpd.depthAttachment.clearDepth = 1.0;
+
+        [_eyeRenderers[eye] renderAtTime:time viewport:vp commandBuffer:cmdBuf passDescriptor:rpd];
+    }
+    [cmdBuf commit];
+}
+
+- (void)onTick:(CADisplayLink *)link
+{
+    (void)link;
+    CFTimeInterval now = CACurrentMediaTime();
+    float dt = static_cast<float>(std::max(0.001, std::min(0.05, now - self.lastTickAt)));
+    self.lastTickAt = now;
+
+    [self updateHeadPose120Hz];
+
+    if (self.headLockMode && self.parsecConnected)
+    {
+        SCNMatrix4 m = self.headNode.worldTransform;
+        SCNVector3 headPos = SCNVector3Make(m.m41, m.m42, m.m43);
+        SCNVector3 curPos = self.cinemaRootNode.position;
+        self.cinemaRootNode.position = SCNVector3Make(curPos.x + (headPos.x - curPos.x) * 0.14f,
+                                                      curPos.y + (headPos.y - curPos.y) * 0.14f,
+                                                      curPos.z + (headPos.z - curPos.z) * 0.14f);
+        float fx = -m.m31;
+        float fz = -m.m33;
+        float targetYaw = atan2f(-fx, -fz);
+        float curYaw = self.cinemaRootNode.eulerAngles.y;
+        float diff = targetYaw - curYaw;
+        while (diff > static_cast<float>(M_PI)) diff -= 2.0f * static_cast<float>(M_PI);
+        while (diff < static_cast<float>(-M_PI)) diff += 2.0f * static_cast<float>(M_PI);
+        self.cinemaRootNode.eulerAngles = SCNVector3Make(0, curYaw + diff * 0.12f, 0);
+    }
+
+    [self pollXboxControllerAtTime:now dt:dt];
+    [self updateParsecStream];
+
+    if (self.barToastText != nil && now >= self.barToastUntil)
+    {
+        self.barToastText = nil;
+        [self redrawParsecBar];
+    }
+
+    if (self.parsecConnected && now >= self.nextBarRedrawAt)
+    {
+        self.nextBarRedrawAt = now + 2.0;
+        [self redrawParsecBar];
+    }
+}
+
+- (void)renderer:(id<SCNSceneRenderer>)renderer willRenderScene:(SCNScene *)scene atTime:(NSTimeInterval)time
+{
+    (void)renderer;
+    (void)scene;
+    if (!self.singleScreenTouchMode)
+        [self renderEyesIntoMetalTexturesAtTime:time];
 }
 
 #pragma mark - Xbox / MFi Controller Engine
@@ -700,12 +1189,12 @@ namespace
     self.barToastUntil = CACurrentMediaTime() + 2.2;
 }
 
-- (void)adjustLensSpacingBy:(float)delta
+- (void)adjustInterLensBy:(float)deltaMeters
 {
-    self.lensSpacingRatio = std::max(0.28f, std::min(0.50f, self.lensSpacingRatio + delta));
-    [self saveVrBoxPreferences];
-    [self updateStereoOrFullLayout];
-    [self showBarToast:[NSString stringWithFormat:@"VR Box Goz Araligi: %.0f%%", self.lensSpacingRatio * 100.0f]];
+    _viewer.interLensDistance = std::max(0.050f, std::min(0.075f, _viewer.interLensDistance + deltaMeters));
+    [[NSUserDefaults standardUserDefaults] setFloat:_viewer.interLensDistance forKey:kPrefQrInterLens];
+    [self rebuildCardboardDistortionRig];
+    [self showBarToast:[NSString stringWithFormat:@"VR Box QR Goz (IPD): %.1f mm", _viewer.interLensDistance * 1000.0f]];
     [self redrawParsecBar];
     if (!self.parsecConnected)
         [self redrawParsecPanel];
@@ -714,7 +1203,7 @@ namespace
 - (void)adjustScreenScaleBy:(float)delta
 {
     self.screenScale = std::max(0.60f, std::min(2.40f, self.screenScale + delta));
-    [self saveVrBoxPreferences];
+    [[NSUserDefaults standardUserDefaults] setFloat:self.screenScale forKey:kPrefScreenScale];
     [self applyScreenLayoutAndScale];
     [self showBarToast:[NSString stringWithFormat:@"Ekran Boyutu: %.0f%%", self.screenScale * 100.0f]];
     [self redrawParsecBar];
@@ -722,10 +1211,27 @@ namespace
 
 - (void)adjustScreenDistBy:(float)delta
 {
-    self.screenDistance = std::max(0.80f, std::min(2.60f, self.screenDistance + delta));
-    [self saveVrBoxPreferences];
+    self.screenDistance = std::max(0.85f, std::min(2.60f, self.screenDistance + delta));
+    [[NSUserDefaults standardUserDefaults] setFloat:self.screenDistance forKey:kPrefScreenDist];
     [self applyScreenLayoutAndScale];
     [self showBarToast:[NSString stringWithFormat:@"Ekran Mesafesi: %.2fm", self.screenDistance]];
+    [self redrawParsecBar];
+}
+
+- (void)cycleEnvMode
+{
+    self.envMode = (self.envMode + 1) % 3;
+    self.envGroupNode.hidden = (self.envMode != 0);
+    if (self.envMode == 0)
+        self.scene.background.contents = ColorHex(0x06070D);
+    else if (self.envMode == 1)
+        self.scene.background.contents = [UIColor blackColor];
+
+    // Toggle stereo eye disparity vs MonoEyes for camera passthrough
+    [self syncArSessionState];
+    [self rebuildCardboardDistortionRig];
+    NSString *msg = self.envMode == 0 ? @"Ortam: 3D VR 120FPS" : (self.envMode == 1 ? @"Ortam: Siyah Sinema" : @"Ortam: Kamera");
+    [self showBarToast:msg];
     [self redrawParsecBar];
 }
 
@@ -798,7 +1304,6 @@ namespace
     float lt = gp.leftTrigger.value;
     float rt = gp.rightTrigger.value;
 
-    // Connected + Xbox 360 Native Gamepad Mode
     if (self.parsecConnected && self.gamepadPassthroughMode)
     {
         BOOL comboToggle = (btnView && btnMenu);
@@ -826,8 +1331,8 @@ namespace
             if (now >= self.nextComboRepeatAt)
             {
                 self.nextComboRepeatAt = now + 0.08;
-                if (dpL) [self adjustLensSpacingBy:-0.008f];
-                if (dpR) [self adjustLensSpacingBy:0.008f];
+                if (dpL) [self adjustInterLensBy:-0.0005f];
+                if (dpR) [self adjustInterLensBy:0.0005f];
                 if (dpU) [self adjustScreenScaleBy:0.08f];
                 if (dpD) [self adjustScreenScaleBy:-0.08f];
             }
@@ -881,7 +1386,6 @@ namespace
         return;
     }
 
-    // UI Panel Navigation (before Parsec is connected)
     if (!self.parsecConnected)
     {
         int navDir = 0;
@@ -909,7 +1413,7 @@ namespace
         }
 
         if ((dpL && !self.prevDpadL) || (dpR && !self.prevDpadR))
-            [self adjustLensSpacingBy:(dpR ? 0.008f : -0.008f)];
+            [self adjustInterLensBy:(dpR ? 0.0005f : -0.0005f)];
         if (btnLB && !self.prevBtnLB)
             [self adjustScreenScaleBy:-0.10f];
         if (btnRB && !self.prevBtnRB)
@@ -945,7 +1449,6 @@ namespace
     }
     else
     {
-        // Connected + VR Mouse & Cinema Control Mode
         if (btnMenu && !self.prevBtnMenu)
         {
             self.prevBtnMenu = YES;
@@ -953,7 +1456,6 @@ namespace
             return;
         }
 
-        // Left Stick moves PC mouse cursor across giant cinema screen with smooth precision curve
         float mx = ApplyDeadzone(lx, 0.09f);
         float my = ApplyDeadzone(ly, 0.09f);
         if (mx != 0.0f || my != 0.0f)
@@ -967,7 +1469,6 @@ namespace
             [self pushCursorUvToParsec];
         }
 
-        // Right Stick Y scrolls mouse wheel on PC
         float sy = ApplyDeadzone(ry, 0.14f);
         if (sy != 0.0f && now >= self.nextNavRepeatAt)
         {
@@ -975,7 +1476,6 @@ namespace
             VRParsecSendMouseWheel(0, static_cast<int>(sy * 110.0f));
         }
 
-        // A Button: Left Mouse Hold & Drag
         if (btnA && !self.prevBtnA)
         {
             AudioServicesPlaySystemSound(1104);
@@ -989,7 +1489,6 @@ namespace
             VRParsecSendMouseButton(self.heldMouseButton, 0);
         }
 
-        // B Button: Right Mouse Click
         if (btnB && !self.prevBtnB)
         {
             AudioServicesPlaySystemSound(1104);
@@ -999,7 +1498,6 @@ namespace
             });
         }
 
-        // X Button: Quick Double Left Click (opens desktop shortcuts easily)
         if (btnX && !self.prevBtnX)
         {
             AudioServicesPlaySystemSound(1104);
@@ -1011,7 +1509,6 @@ namespace
             });
         }
 
-        // Y Button: Recenter cinema screen
         if (btnY && !self.prevBtnY)
         {
             AudioServicesPlaySystemSound(1104);
@@ -1020,33 +1517,27 @@ namespace
             [self redrawParsecBar];
         }
 
-        // D-Pad L/R: Live VR Box IPD lens convergence
         if (dpL || dpR || dpU || dpD)
         {
             if (now >= self.nextComboRepeatAt)
             {
                 self.nextComboRepeatAt = now + 0.09;
-                if (dpL) [self adjustLensSpacingBy:-0.008f];
-                if (dpR) [self adjustLensSpacingBy:0.008f];
+                if (dpL) [self adjustInterLensBy:-0.0005f];
+                if (dpR) [self adjustInterLensBy:0.0005f];
                 if (dpU) [self adjustScreenScaleBy:0.08f];
                 if (dpD) [self adjustScreenScaleBy:-0.08f];
             }
         }
 
-        // LB / RB: Distance closer / further
         if (btnLB && !self.prevBtnLB)
             [self adjustScreenDistBy:0.12f];
         if (btnRB && !self.prevBtnRB)
             [self adjustScreenDistBy:-0.12f];
 
-        // View button alone in Mouse Mode toggles Head-Lock vs World 6DoF Lock
         if (btnView && !self.prevComboToggle && now >= self.nextNavRepeatAt)
         {
             self.nextNavRepeatAt = now + 0.30;
-            self.headLockMode = !self.headLockMode;
-            AudioServicesPlaySystemSound(1104);
-            [self showBarToast:(self.headLockMode ? @"Kafa Takip Modu: ACIK" : @"Odaya Sabit 6DoF Modu")];
-            [self redrawParsecBar];
+            [self cycleEnvMode];
         }
     }
 
@@ -1083,50 +1574,7 @@ namespace
                                                     0.015f);
 }
 
-#pragma mark - 120 Hz Frame Tick
-
-- (void)onTick:(CADisplayLink *)link
-{
-    (void)link;
-    CFTimeInterval now = CACurrentMediaTime();
-    float dt = static_cast<float>(std::max(0.001, std::min(0.05, now - self.lastTickAt)));
-    self.lastTickAt = now;
-
-    if (self.headLockMode && self.parsecConnected)
-    {
-        SCNMatrix4 m = self.headNode.worldTransform;
-        SCNVector3 headPos = SCNVector3Make(m.m41, m.m42, m.m43);
-        SCNVector3 curPos = self.cinemaRootNode.position;
-        self.cinemaRootNode.position = SCNVector3Make(curPos.x + (headPos.x - curPos.x) * 0.14f,
-                                                      curPos.y + (headPos.y - curPos.y) * 0.14f,
-                                                      curPos.z + (headPos.z - curPos.z) * 0.14f);
-        float fx = -m.m31;
-        float fz = -m.m33;
-        float targetYaw = atan2f(-fx, -fz);
-        float curYaw = self.cinemaRootNode.eulerAngles.y;
-        float diff = targetYaw - curYaw;
-        while (diff > M_PI) diff -= 2.0f * static_cast<float>(M_PI);
-        while (diff < -M_PI) diff += 2.0f * static_cast<float>(M_PI);
-        self.cinemaRootNode.eulerAngles = SCNVector3Make(0, curYaw + diff * 0.12f, 0);
-    }
-
-    [self pollXboxControllerAtTime:now dt:dt];
-    [self updateParsecStream];
-
-    if (self.barToastText != nil && now >= self.barToastUntil)
-    {
-        self.barToastText = nil;
-        [self redrawParsecBar];
-    }
-
-    if (self.parsecConnected && now >= self.nextBarRedrawAt)
-    {
-        self.nextBarRedrawAt = now + 2.0;
-        [self redrawParsecBar];
-    }
-}
-
-#pragma mark - Fallback Gaze & Screen Touch Interaction
+#pragma mark - Gaze & Touch Raycast
 
 - (BOOL)isCandidateVisible:(SCNNode *)node
 {
@@ -1197,14 +1645,10 @@ namespace
     return [self raycastOrigin:SCNVector3Make(wo.x, wo.y, wo.z) dir:SCNVector3Make(d.x, d.y, d.z)];
 }
 
-- (VRRayHit)raycastTouchPoint:(CGPoint)ptInView
+- (VRRayHit)raycastFlat2DTouchPoint:(CGPoint)ptInView
 {
-    SCNView *targetView = (self.singleScreenTouchMode || ptInView.x <= self.view.bounds.size.width * 0.5)
-        ? self.leftView
-        : self.rightView;
-    CGPoint localPt = [targetView convertPoint:ptInView fromView:self.view];
-    SCNVector3 pNear = [targetView unprojectPoint:SCNVector3Make(localPt.x, localPt.y, 0.0f)];
-    SCNVector3 pFar = [targetView unprojectPoint:SCNVector3Make(localPt.x, localPt.y, 1.0f)];
+    SCNVector3 pNear = [self.compositorView unprojectPoint:SCNVector3Make(ptInView.x, ptInView.y, 0.0f)];
+    SCNVector3 pFar = [self.compositorView unprojectPoint:SCNVector3Make(ptInView.x, ptInView.y, 1.0f)];
     float dx = pFar.x - pNear.x;
     float dy = pFar.y - pNear.y;
     float dz = pFar.z - pNear.z;
@@ -1238,10 +1682,9 @@ namespace
 
     UITouch *touch = [touches anyObject];
     if (!touch) return;
-    CGPoint pt = [touch locationInView:self.view];
-    VRRayHit hit = [self raycastTouchPoint:pt];
-    if (!hit.node && !self.singleScreenTouchMode)
-        hit = [self raycastCenterGaze];
+    VRRayHit hit = self.singleScreenTouchMode
+        ? [self raycastFlat2DTouchPoint:[touch locationInView:self.view]]
+        : [self raycastCenterGaze];
     if (!hit.node) return;
 
     if (hit.node == self.parsecScreenNode && self.parsecConnected)
@@ -1282,8 +1725,8 @@ namespace
     }
 
     UITouch *touch = [touches anyObject];
-    if (!touch || !self.parsecMouseHeld || !self.parsecConnected) return;
-    VRRayHit hit = [self raycastTouchPoint:[touch locationInView:self.view]];
+    if (!touch || !self.parsecMouseHeld || !self.parsecConnected || !self.singleScreenTouchMode) return;
+    VRRayHit hit = [self raycastFlat2DTouchPoint:[touch locationInView:self.view]];
     if (hit.node == self.parsecScreenNode)
     {
         self.cursorUv = hit.uv;
@@ -1316,20 +1759,16 @@ namespace
     }
 }
 
-#pragma mark - UI Button Actions & Actions
+#pragma mark - UI Button Actions
 
 - (void)handleButtonClick:(NSString *)btnId
 {
-    if ([btnId isEqualToString:@"auth_email"]) { self.loginField = LoginField::Email; [self openQuickSetupAlert]; return; }
-    if ([btnId isEqualToString:@"auth_pass"]) { self.loginField = LoginField::Password; [self openQuickSetupAlert]; return; }
-    if ([btnId isEqualToString:@"auth_tfa"]) { self.loginField = LoginField::Tfa; [self openQuickSetupAlert]; return; }
-    if ([btnId isEqualToString:@"auth_signin"]) { [self startParsecSignIn]; return; }
     if ([btnId isEqualToString:@"auth_setup"]) { [self openQuickSetupAlert]; return; }
     if ([btnId isEqualToString:@"hosts_refresh"]) { [self refreshHosts]; return; }
     if ([btnId isEqualToString:@"hosts_signout"]) { [self signOutParsec]; return; }
     if ([btnId isEqualToString:@"connect_cancel"]) { [self cancelConnect]; return; }
-    if ([btnId isEqualToString:@"ipd_minus"]) { [self adjustLensSpacingBy:-0.01f]; return; }
-    if ([btnId isEqualToString:@"ipd_plus"]) { [self adjustLensSpacingBy:0.01f]; return; }
+    if ([btnId isEqualToString:@"ipd_minus"]) { [self adjustInterLensBy:-0.001f]; return; }
+    if ([btnId isEqualToString:@"ipd_plus"]) { [self adjustInterLensBy:0.001f]; return; }
 
     if ([btnId hasPrefix:@"host_"])
     {
@@ -1341,26 +1780,26 @@ namespace
     if ([btnId isEqualToString:@"bar_mode"]) { [self toggleGamepadMode]; return; }
     if ([btnId isEqualToString:@"bar_sz_minus"]) { [self adjustScreenScaleBy:-0.10f]; return; }
     if ([btnId isEqualToString:@"bar_sz_plus"]) { [self adjustScreenScaleBy:0.10f]; return; }
-    if ([btnId isEqualToString:@"bar_ipd_minus"]) { [self adjustLensSpacingBy:-0.01f]; return; }
-    if ([btnId isEqualToString:@"bar_ipd_plus"]) { [self adjustLensSpacingBy:0.01f]; return; }
+    if ([btnId isEqualToString:@"bar_ipd_minus"]) { [self adjustInterLensBy:-0.001f]; return; }
+    if ([btnId isEqualToString:@"bar_ipd_plus"]) { [self adjustInterLensBy:0.001f]; return; }
     if ([btnId isEqualToString:@"bar_lock"])
     {
         self.headLockMode = !self.headLockMode;
         [self redrawParsecBar];
         return;
     }
-    if ([btnId isEqualToString:@"bar_room"])
+    if ([btnId isEqualToString:@"bar_env"])
     {
-        self.passthroughOn = !self.passthroughOn;
-        if (!self.passthroughOn)
-            self.scene.background.contents = [UIColor blackColor];
-        [self redrawParsecBar];
+        [self cycleEnvMode];
         return;
     }
-    if ([btnId isEqualToString:@"bar_mute"])
+    if ([btnId isEqualToString:@"bar_dof"])
     {
-        self.muted = !self.muted;
-        VRParsecSetMuted(self.muted ? 1 : 0);
+        self.sixDofEnabled = !self.sixDofEnabled;
+        if (self.sixDofEnabled && self.hasArPosition)
+            self.arHeadOffset = self.arHeadPos;
+        [self syncArSessionState];
+        [self showBarToast:(self.sixDofEnabled ? @"Takip: 6DoF (120Hz IMU + AR)" : @"Takip: 3DoF (Saf 120Hz IMU)")];
         [self redrawParsecBar];
         return;
     }
@@ -1393,8 +1832,8 @@ namespace
     self.parsecScreenNode.hidden = !self.parsecConnected;
     self.parsecBarNode.hidden = !self.parsecConnected;
     self.parsecPanelNode.hidden = self.parsecConnected;
+    self.gazeDotNode.hidden = self.parsecConnected;
     self.parsecCursorNode.hidden = !self.parsecConnected || self.gamepadPassthroughMode;
-    [self updateStereoOrFullLayout];
 }
 
 #pragma mark - Parsec Stream & Auth
@@ -1483,8 +1922,8 @@ namespace
 
 - (void)openQuickSetupAlert
 {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Parsec & VR Box Setup"
-                                                                   message:@"Sign in once; saved in iOS Keychain. Adjust VR Box Goz Araligi anytime with Xbox D-Pad Left/Right."
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Parsec & VR BOX QR Setup"
+                                                                   message:[NSString stringWithFormat:@"QR Profile: VR BOX (IPD %.1f mm). Adjust IPD anytime with Xbox D-Pad Left/Right.", _viewer.interLensDistance * 1000.0f]
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.placeholder = @"Parsec Email";
@@ -1505,13 +1944,12 @@ namespace
             tf.keyboardType = UIKeyboardTypeNumberPad;
         }];
     }
-    [alert addAction:[UIAlertAction actionWithTitle:@"VR Box Goz -" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+    [alert addAction:[UIAlertAction actionWithTitle:@"Reset VR BOX QR (63mm)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         (void)a;
-        [self adjustLensSpacingBy:-0.015f];
-    }]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"VR Box Goz +" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        (void)a;
-        [self adjustLensSpacingBy:0.015f];
+        _viewer.interLensDistance = 0.063000f;
+        [[NSUserDefaults standardUserDefaults] setFloat:_viewer.interLensDistance forKey:kPrefQrInterLens];
+        [self rebuildCardboardDistortionRig];
+        [self redrawAllPanels];
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Sign In" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
@@ -1790,8 +2228,10 @@ namespace
     CGSize sz = CGSizeMake(960, 680);
     UIGraphicsImageRenderer *r = [self makeUiRendererWithSize:sz];
     NSString *ctrlText = self.activeController
-        ? [NSString stringWithFormat:@"Xbox Kolu: BAGLI (%@)", self.activeController.vendorName ?: @"Gamepad"]
-        : @"Xbox Kolu: Bekleniyor (Bluetooth ile eslestir)";
+        ? [NSString stringWithFormat:@"Xbox Kolu: BAGLI (%@)  |  QR: VR BOX (IPD %.1f mm)",
+           self.activeController.vendorName ?: @"Gamepad", _viewer.interLensDistance * 1000.0f]
+        : [NSString stringWithFormat:@"Xbox Kolu: Bekleniyor (Bluetooth ile eslestir)  |  QR: VR BOX (%.1f mm)",
+           _viewer.interLensDistance * 1000.0f];
     UIColor *ctrlColor = self.activeController ? ColorHex(0x80E5A3) : ColorHex(0xF6C177);
 
     UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
@@ -1799,7 +2239,7 @@ namespace
         [ColorHex(0x1D1B22, 0.96) setFill];
         [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, sz.width, sz.height) cornerRadius:34] fill];
 
-        [self drawText:@"VR Box Parsec Cinema" rect:CGRectMake(40, 26, 520, 42) size:32 color:ColorHex(0xE6E0E9) bold:YES align:NSTextAlignmentLeft];
+        [self drawText:@"VR BOX Parsec Cinema (120 FPS)" rect:CGRectMake(40, 26, 760, 42) size:32 color:ColorHex(0xE6E0E9) bold:YES align:NSTextAlignmentLeft];
         [self drawText:ctrlText rect:CGRectMake(40, 72, 880, 28) size:19 color:ctrlColor bold:YES align:NSTextAlignmentLeft];
         [self drawText:self.parsecStateMessage rect:CGRectMake(40, 108, 880, 48) size:20
                  color:(self.parsecStateIsError ? ColorHex(0xF2B8B5) : ColorHex(0xCAC4D0)) bold:NO align:NSTextAlignmentLeft];
@@ -1830,9 +2270,9 @@ namespace
             [self drawButton:CGRectMake(44, 486, 260, 62) canvas:sz buttonId:@"hosts_refresh" title:@"Refresh PCs (X)"
                     selected:NO xboxFocused:idxFocus(itemIdx++) outlined:YES filled:NO disabled:self.isHostsBusy hitList:_parsecPanelHits];
             [self drawButton:CGRectMake(330, 486, 190, 62) canvas:sz buttonId:@"ipd_minus"
-                       title:[NSString stringWithFormat:@"Goz - (%.0f%%)", self.lensSpacingRatio * 100.0f]
+                       title:[NSString stringWithFormat:@"IPD - (%.1fmm)", _viewer.interLensDistance * 1000.0f]
                     selected:NO xboxFocused:idxFocus(itemIdx++) outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
-            [self drawButton:CGRectMake(534, 486, 176, 62) canvas:sz buttonId:@"ipd_plus" title:@"Goz +"
+            [self drawButton:CGRectMake(534, 486, 176, 62) canvas:sz buttonId:@"ipd_plus" title:@"IPD +"
                     selected:NO xboxFocused:idxFocus(itemIdx++) outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
             [self drawButton:CGRectMake(726, 486, 190, 62) canvas:sz buttonId:@"hosts_signout" title:@"Sign Out"
                     selected:NO xboxFocused:idxFocus(itemIdx++) outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
@@ -1844,13 +2284,13 @@ namespace
                        title:@"Tap Top-Left 'Parsec Setup' on iPhone to Sign In"
                     selected:NO xboxFocused:idxFocus(itemIdx++) outlined:NO filled:YES disabled:NO hitList:_parsecPanelHits];
             [self drawButton:CGRectMake(44, 280, 420, 68) canvas:sz buttonId:@"ipd_minus"
-                       title:[NSString stringWithFormat:@"VR Box Goz Araligi - (%.0f%%)", self.lensSpacingRatio * 100.0f]
+                       title:[NSString stringWithFormat:@"VR BOX IPD - (%.1f mm)", _viewer.interLensDistance * 1000.0f]
                     selected:NO xboxFocused:idxFocus(itemIdx++) outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
-            [self drawButton:CGRectMake(496, 280, 420, 68) canvas:sz buttonId:@"ipd_plus" title:@"VR Box Goz Araligi +"
+            [self drawButton:CGRectMake(496, 280, 420, 68) canvas:sz buttonId:@"ipd_plus" title:@"VR BOX IPD +"
                     selected:NO xboxFocused:idxFocus(itemIdx++) outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
         }
 
-        [self drawText:@"Xbox Kontrol: D-Pad Up/Dn: Sec | A: Baglan | X: Yenile | D-Pad L/R: VR Box Goz Birlestir | Y: Ortala"
+        [self drawText:@"Xbox Kontrol: D-Pad Up/Dn: Sec | A: Baglan | X: Yenile | D-Pad L/R: IPD (mm) | Y: Ortala"
                   rect:CGRectMake(40, 616, 880, 34) size:18 color:ColorHex(0xA9A3B5) bold:YES align:NSTextAlignmentCenter];
     }];
     self.parsecPanelNode.geometry.firstMaterial.diffuse.contents = img;
@@ -1859,21 +2299,22 @@ namespace
 - (void)redrawParsecBar
 {
     _parsecBarHits.clear();
-    CGSize sz = CGSizeMake(1400, 186);
+    CGSize sz = CGSizeMake(1440, 186);
     UIGraphicsImageRenderer *r = [self makeUiRendererWithSize:sz];
 
     NSString *modeLabel = self.gamepadPassthroughMode
-        ? @"MOD: XBOX OYUN KOLU (View+Menu = Fare)"
-        : @"MOD: FARE / MASAUSTU (Menu = Oyun Kolu)";
+        ? @"MOD: XBOX KOLU (View+Menu=Fare)"
+        : @"MOD: FARE (Menu=Oyun Kolu)";
     NSString *statusLine = (self.barToastText.length > 0)
         ? self.barToastText
-        : [NSString stringWithFormat:@"%@ (%dx%d)  |  %@  |  Goz: %.0f%%  Boyut: %.0f%%",
+        : [NSString stringWithFormat:@"%@ (%dx%d)  |  %@  |  QR: VR BOX %.1f mm  Boyut: %.0f%%",
            self.connectedHostName, self.hostWidth, self.hostHeight,
            (self.activeController ? @"Xbox Bagli" : @"Xbox Yok"),
-           self.lensSpacingRatio * 100.0f, self.screenScale * 100.0f];
+           _viewer.interLensDistance * 1000.0f, self.screenScale * 100.0f];
     NSString *hintLine = self.gamepadPassthroughMode
-        ? @"Tam Xbox 360 Kolu PC'ye Aktariliyor!  |  View basili tut + [Menu: Fare Modu | Y: Ortala | D-Pad L/R: VR Box Goz | D-Pad U/D: Boyut]"
-        : @"L-Stick: Fare | A: Sol Tik/Surukle | B: Sag Tik | X: Cift Tik | R-Stick: Kaydir | Y: Ortala | D-Pad L/R: Goz | D-Pad U/D: Boyut | LB/RB: Mesafe";
+        ? @"Tam Xbox 360 Kolu PC'ye Aktariliyor!  |  View basili tut + [Menu: Fare Modu | Y: Ortala | D-Pad L/R: IPD | D-Pad U/D: Boyut]"
+        : @"L-Stick: Fare | A: Sol Tik/Surukle | B: Sag Tik | X: Cift Tik | R-Stick: Kaydir | Y: Ortala | D-Pad: IPD/Boyut | LB/RB: Mesafe";
+    NSString *envLabel = self.envMode == 0 ? @"3D Ortam" : (self.envMode == 1 ? @"Siyah" : @"Kamera");
 
     UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
         (void)ctx;
@@ -1881,28 +2322,29 @@ namespace
         [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, sz.width, sz.height) cornerRadius:28] fill];
 
         UIColor *topColor = (self.barToastText.length > 0) ? ColorHex(0x80E5A3) : ColorHex(0xE6E0E9);
-        [self drawText:statusLine rect:CGRectMake(26, 16, 1348, 30) size:22 color:topColor bold:YES align:NSTextAlignmentLeft];
+        [self drawText:statusLine rect:CGRectMake(26, 16, 1388, 30) size:22 color:topColor bold:YES align:NSTextAlignmentLeft];
 
-        [self drawButton:CGRectMake(24, 56, 400, 58) canvas:sz buttonId:@"bar_mode" title:modeLabel
+        [self drawButton:CGRectMake(24, 56, 360, 58) canvas:sz buttonId:@"bar_mode" title:modeLabel
                 selected:self.gamepadPassthroughMode xboxFocused:NO outlined:NO filled:YES disabled:NO hitList:_parsecBarHits];
-        [self drawButton:CGRectMake(436, 56, 114, 58) canvas:sz buttonId:@"bar_ipd_minus" title:@"Goz -"
+        [self drawButton:CGRectMake(396, 56, 106, 58) canvas:sz buttonId:@"bar_ipd_minus" title:@"IPD -"
                 selected:NO xboxFocused:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
-        [self drawButton:CGRectMake(560, 56, 114, 58) canvas:sz buttonId:@"bar_ipd_plus" title:@"Goz +"
+        [self drawButton:CGRectMake(512, 56, 106, 58) canvas:sz buttonId:@"bar_ipd_plus" title:@"IPD +"
                 selected:NO xboxFocused:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
-        [self drawButton:CGRectMake(686, 56, 118, 58) canvas:sz buttonId:@"bar_sz_minus" title:@"Boyut -"
+        [self drawButton:CGRectMake(630, 56, 114, 58) canvas:sz buttonId:@"bar_sz_minus" title:@"Boyut -"
                 selected:NO xboxFocused:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
-        [self drawButton:CGRectMake(814, 56, 118, 58) canvas:sz buttonId:@"bar_sz_plus" title:@"Boyut +"
+        [self drawButton:CGRectMake(754, 56, 114, 58) canvas:sz buttonId:@"bar_sz_plus" title:@"Boyut +"
                 selected:NO xboxFocused:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
-        [self drawButton:CGRectMake(944, 56, 146, 58) canvas:sz buttonId:@"bar_lock"
-                   title:(self.headLockMode ? @"Kafa Takip" : @"6DoF Sabit")
-                selected:self.headLockMode xboxFocused:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
-        [self drawButton:CGRectMake(1102, 56, 134, 58) canvas:sz buttonId:@"bar_room"
-                   title:(self.passthroughOn ? @"Kamera" : @"Siyah")
-                selected:self.passthroughOn xboxFocused:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
-        [self drawButton:CGRectMake(1248, 56, 128, 58) canvas:sz buttonId:@"bar_disc" title:@"Kes"
+        [self drawButton:CGRectMake(880, 56, 136, 58) canvas:sz buttonId:@"bar_env" title:envLabel
+                selected:(self.envMode == 0) xboxFocused:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
+        [self drawButton:CGRectMake(1028, 56, 130, 58) canvas:sz buttonId:@"bar_dof"
+                   title:(self.sixDofEnabled ? @"6DoF" : @"3DoF")
+                selected:self.sixDofEnabled xboxFocused:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
+        [self drawButton:CGRectMake(1170, 56, 122, 58) canvas:sz buttonId:@"bar_recenter" title:@"Ortala"
+                selected:NO xboxFocused:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
+        [self drawButton:CGRectMake(1304, 56, 112, 58) canvas:sz buttonId:@"bar_disc" title:@"Kes"
                 selected:NO xboxFocused:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
 
-        [self drawText:hintLine rect:CGRectMake(26, 132, 1348, 34) size:17 color:ColorHex(0xA9A3B5) bold:YES align:NSTextAlignmentCenter];
+        [self drawText:hintLine rect:CGRectMake(26, 132, 1388, 34) size:17 color:ColorHex(0xA9A3B5) bold:YES align:NSTextAlignmentCenter];
     }];
     self.parsecBarNode.geometry.firstMaterial.diffuse.contents = img;
 }
