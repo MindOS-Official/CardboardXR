@@ -2,6 +2,7 @@
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -19,9 +20,18 @@ void VRParsecSetSecondStreamEnabled(int enabled);
 id VRParsecPollStreamTexture(int streamIndex, int *outUpdated);
 UIImage *VRParsecPollStreamImage(int streamIndex, int timeoutMs);
 void VRParsecSendStreamMousePosition(int streamIndex, int x, int y);
+void VRParsecSendRelativeMouse(int dx, int dy);
 void VRParsecSendMouseButton(int button, int pressed);
 void VRParsecSendMouseWheel(int deltaX, int deltaY);
 void VRParsecSendKey(int usbHidKeyCode, int pressed);
+void VRParsecSendGamepadState(uint16_t buttons,
+                              int16_t thumbLX,
+                              int16_t thumbLY,
+                              int16_t thumbRX,
+                              int16_t thumbRY,
+                              uint8_t leftTrigger,
+                              uint8_t rightTrigger);
+void VRParsecUnplugGamepad(void);
 void VRParsecSetMuted(int muted);
 
 void VRKeychainSave(const char *key, const char *value);

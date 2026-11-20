@@ -32,6 +32,7 @@ targets:
         codeSign: false
       - sdk: ARKit.framework
       - sdk: Accelerate.framework
+      - sdk: GameController.framework
       - sdk: SceneKit.framework
       - sdk: Vision.framework
       - sdk: WebKit.framework

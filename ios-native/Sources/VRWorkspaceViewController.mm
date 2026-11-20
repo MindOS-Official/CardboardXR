@@ -1,94 +1,57 @@
-// Native iOS stereoscopic VR cockpit combining ARKit 6DoF tracking, Vision hand pinch
-// tracking, SceneKit dual-eye rendering, Parsec dual-stream PC desktop, 5 giant placeable
-// WebKit/PC-2 side monitors, and a 3D Air Keyboard.
+// Dedicated 120 FPS VR Box Parsec Cinema app controlled by Xbox / MFi controller (GameController.framework).
+// Features tunable VR Box inward viewport spacing for crisp eye fusion, zero-disparity stereo axis,
+// Cinema Black 120 FPS mode or optional ARKit room passthrough, and full Mouse + native Xbox 360 gamepad pass-through.
 
 #import "VRWorkspaceViewController.h"
 #import "VRBridge.h"
 #import <ARKit/ARKit.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <CoreImage/CoreImage.h>
+#import <GameController/GameController.h>
 #import <Metal/Metal.h>
 #import <SceneKit/SceneKit.h>
-#import <Vision/Vision.h>
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <vector>
 
 namespace
 {
-    constexpr float kEyeSeparation = 0.063f;
-    constexpr float kParsecDist = 1.35f;
-    constexpr float kSideMonitorDist = 1.40f;
-    constexpr float kKeyboardDist = 0.68f;
-    constexpr float kKeyboardPitchDeg = -26.0f;
-    constexpr int kHandJointCount = 21;
-    constexpr int kHandBoneCount = 20;
+    constexpr float kBaseScreenWidth = 1.72f;
+    constexpr float kDefaultScreenScale = 1.05f;
+    constexpr float kDefaultScreenDist = 1.35f;
+    constexpr float kDefaultLensSpacing = 0.40f; // 40% of landscape width per eye (~56 mm center-to-center on iPhone 14 Pro)
+    constexpr float kDefaultEyeHeight = 0.86f;
+    constexpr float kDefaultFov = 78.0f;
     constexpr const char *kKeychainSessionKey = "cardboardxr_native_parsec_session_v1";
 
-    constexpr int kHandBonePairs[kHandBoneCount][2] = {
-        {0, 1}, {1, 2}, {2, 3}, {3, 4},
-        {0, 5}, {5, 6}, {6, 7}, {7, 8},
-        {0, 9}, {9, 10}, {10, 11}, {11, 12},
-        {0, 13}, {13, 14}, {14, 15}, {15, 16},
-        {0, 17}, {17, 18}, {18, 19}, {19, 20},
-    };
+    NSString *const kPrefLensSpacing = @"vrbox_lens_spacing_v1";
+    NSString *const kPrefEyeHeight = @"vrbox_eye_height_v1";
+    NSString *const kPrefScreenScale = @"vrbox_screen_scale_v1";
+    NSString *const kPrefScreenDist = @"vrbox_screen_dist_v1";
 
-    NSArray<VNHumanHandPoseObservationJointName> *OrderedHandJointNames()
-    {
-        static NSArray<VNHumanHandPoseObservationJointName> *names = nil;
-        static dispatch_once_t once;
-        dispatch_once(&once, ^{
-            names = @[
-                VNHumanHandPoseObservationJointNameWrist,
-                VNHumanHandPoseObservationJointNameThumbCMC,
-                VNHumanHandPoseObservationJointNameThumbMP,
-                VNHumanHandPoseObservationJointNameThumbIP,
-                VNHumanHandPoseObservationJointNameThumbTip,
-                VNHumanHandPoseObservationJointNameIndexMCP,
-                VNHumanHandPoseObservationJointNameIndexPIP,
-                VNHumanHandPoseObservationJointNameIndexDIP,
-                VNHumanHandPoseObservationJointNameIndexTip,
-                VNHumanHandPoseObservationJointNameMiddleMCP,
-                VNHumanHandPoseObservationJointNameMiddlePIP,
-                VNHumanHandPoseObservationJointNameMiddleDIP,
-                VNHumanHandPoseObservationJointNameMiddleTip,
-                VNHumanHandPoseObservationJointNameRingMCP,
-                VNHumanHandPoseObservationJointNameRingPIP,
-                VNHumanHandPoseObservationJointNameRingDIP,
-                VNHumanHandPoseObservationJointNameRingTip,
-                VNHumanHandPoseObservationJointNameLittleMCP,
-                VNHumanHandPoseObservationJointNameLittlePIP,
-                VNHumanHandPoseObservationJointNameLittleDIP,
-                VNHumanHandPoseObservationJointNameLittleTip,
-            ];
-        });
-        return names;
-    }
+    // ParsecSDK ParsecGamepadState bitmask values (from parsec.h)
+    constexpr uint16_t kParsecBtnDpadUp = 0x0001;
+    constexpr uint16_t kParsecBtnDpadDown = 0x0002;
+    constexpr uint16_t kParsecBtnDpadLeft = 0x0004;
+    constexpr uint16_t kParsecBtnDpadRight = 0x0008;
+    constexpr uint16_t kParsecBtnStart = 0x0010;
+    constexpr uint16_t kParsecBtnBack = 0x0020;
+    constexpr uint16_t kParsecBtnLThumb = 0x0040;
+    constexpr uint16_t kParsecBtnRThumb = 0x0080;
+    constexpr uint16_t kParsecBtnLShoulder = 0x0100;
+    constexpr uint16_t kParsecBtnRShoulder = 0x0200;
+    constexpr uint16_t kParsecBtnGuide = 0x0400;
+    constexpr uint16_t kParsecBtnA = 0x1000;
+    constexpr uint16_t kParsecBtnB = 0x2000;
+    constexpr uint16_t kParsecBtnX = 0x4000;
+    constexpr uint16_t kParsecBtnY = 0x8000;
 
-    struct VRRayHit
+    enum class LoginField
     {
-        SCNNode *node = nil;
-        CGPoint uv = CGPointZero;
-        float dist = 1e9f;
-        SCNVector3 worldPoint = SCNVector3Zero;
-    };
-
-    enum class InputTarget
-    {
-        ParsecEmail,
-        ParsecPassword,
-        ParsecTfa,
-        WebUrl,
-        ParsecHost,
-        WebPage,
-    };
-
-    struct KeySpec
-    {
-        const char *normal;
-        const char *shift;
-        float units;
-        int usbHid;
+        Email = 0,
+        Password = 1,
+        Tfa = 2,
     };
 
     struct VRButtonHit
@@ -100,81 +63,22 @@ namespace
         BOOL disabled;
     };
 
-    struct SideMonitorSlot
+    struct VRRayHit
     {
-        int index = 0;
-        BOOL active = NO;
-        BOOL useParsecStream2 = NO;
-        BOOL urlEditing = NO;
-        float defaultYawDeg = 0.0f;
-        float defaultPitchDeg = 0.0f;
-        float defaultDist = kSideMonitorDist;
-        SCNNode *anchorNode = nil;
-        SCNNode *screenNode = nil;
-        SCNNode *barNode = nil;
-        SCNNode *grabNode = nil;
-        SCNNode *cursorNode = nil;
-        NSString *urlText = nil;
-        std::vector<VRButtonHit> barHits;
+        SCNNode *node = nil;
+        CGPoint uv = CGPointZero;
+        float dist = 1e9f;
     };
 
-    int MapCharToUsbHid(char c, BOOL *outShift)
+    static UIColor *ColorHex(uint32_t hex, CGFloat alpha = 1.0)
     {
-        *outShift = NO;
-        if (c >= 'a' && c <= 'z') return 4 + (c - 'a');
-        if (c >= 'A' && c <= 'Z') { *outShift = YES; return 4 + (c - 'A'); }
-        if (c >= '1' && c <= '9') return 30 + (c - '1');
-        if (c == '0') return 39;
-        switch (c)
-        {
-            case ' ': return 44;
-            case '\n': case '\r': return 40;
-            case '\t': return 43;
-            case '-': return 45;
-            case '_': *outShift = YES; return 45;
-            case '=': return 46;
-            case '+': *outShift = YES; return 46;
-            case '[': return 47;
-            case '{': *outShift = YES; return 47;
-            case ']': return 48;
-            case '}': *outShift = YES; return 48;
-            case '\\': return 49;
-            case '|': *outShift = YES; return 49;
-            case ';': return 51;
-            case ':': *outShift = YES; return 51;
-            case '\'': return 52;
-            case '"': *outShift = YES; return 52;
-            case '`': return 53;
-            case '~': *outShift = YES; return 53;
-            case ',': return 54;
-            case '<': *outShift = YES; return 54;
-            case '.': return 55;
-            case '>': *outShift = YES; return 55;
-            case '/': return 56;
-            case '?': *outShift = YES; return 56;
-            case '!': *outShift = YES; return 30;
-            case '@': *outShift = YES; return 31;
-            case '#': *outShift = YES; return 32;
-            case '$': *outShift = YES; return 33;
-            case '%': *outShift = YES; return 34;
-            case '^': *outShift = YES; return 35;
-            case '&': *outShift = YES; return 36;
-            case '*': *outShift = YES; return 37;
-            case '(': *outShift = YES; return 38;
-            case ')': *outShift = YES; return 39;
-            default: return 0;
-        }
+        CGFloat r = ((hex >> 16) & 0xFF) / 255.0;
+        CGFloat g = ((hex >> 8) & 0xFF) / 255.0;
+        CGFloat b = (hex & 0xFF) / 255.0;
+        return [UIColor colorWithRed:r green:g blue:b alpha:alpha];
     }
 
-    UIColor *ColorHex(uint32_t rgb, CGFloat alpha = 1.0)
-    {
-        return [UIColor colorWithRed:((rgb >> 16) & 0xFF) / 255.0
-                               green:((rgb >> 8) & 0xFF) / 255.0
-                                blue:(rgb & 0xFF) / 255.0
-                               alpha:alpha];
-    }
-
-    NSString *FormatParsecStatus(int st)
+    static NSString *FormatParsecStatus(int st)
     {
         switch (st)
         {
@@ -191,6 +95,30 @@ namespace
             default: return [NSString stringWithFormat:@"Status %d", st];
         }
     }
+
+    static float ApplyDeadzone(float v, float dz)
+    {
+        float av = fabsf(v);
+        if (av <= dz)
+            return 0.0f;
+        float scaled = (av - dz) / (1.0f - dz);
+        return (v < 0.0f) ? -scaled : scaled;
+    }
+
+    static int16_t FloatToThumbAxis(float v)
+    {
+        float dz = ApplyDeadzone(v, 0.08f);
+        float clamped = std::max(-1.0f, std::min(1.0f, dz));
+        return static_cast<int16_t>(clamped * 32767.0f);
+    }
+
+    static uint8_t FloatToTriggerByte(float v)
+    {
+        float clamped = std::max(0.0f, std::min(1.0f, v));
+        if (clamped < 0.03f)
+            return 0;
+        return static_cast<uint8_t>(clamped * 255.0f);
+    }
 }
 
 @interface VRWorkspaceViewController () <ARSessionDelegate>
@@ -201,31 +129,21 @@ namespace
 @property (nonatomic, strong) SCNNode *headNode;
 @property (nonatomic, strong) SCNNode *leftEyeNode;
 @property (nonatomic, strong) SCNNode *rightEyeNode;
-@property (nonatomic, strong) SCNNode *workspaceRoot;
-@property (nonatomic, strong) SCNNode *floorNode;
-
-@property (nonatomic, strong) SCNNode *mainAnchorNode;
+@property (nonatomic, strong) SCNNode *cinemaRootNode;
+@property (nonatomic, strong) SCNNode *screenAnchorNode;
 @property (nonatomic, strong) SCNNode *parsecScreenNode;
 @property (nonatomic, strong) SCNNode *parsecPanelNode;
 @property (nonatomic, strong) SCNNode *parsecBarNode;
-@property (nonatomic, strong) SCNNode *dockNode;
-@property (nonatomic, strong) SCNNode *keyboardNode;
 @property (nonatomic, strong) SCNNode *parsecCursorNode;
-@property (nonatomic, strong) SCNNode *palmMenuNode;
-@property (nonatomic, strong) SCNNode *mainGrabNode;
-@property (nonatomic, strong) SCNNode *keyboardGrabNode;
-@property (nonatomic, strong) SCNNode *dockGrabNode;
-@property (nonatomic, strong) SCNNode *hoverHighlightNode;
-@property (nonatomic, strong) SCNNode *handRayNode;
-@property (nonatomic, strong) SCNMaterial *indexTipMat;
+@property (nonatomic, strong) SCNNode *floorNode;
 
+@property (nonatomic, strong) UIView *dividerLine;
 @property (nonatomic, strong) UIView *leftReticle;
 @property (nonatomic, strong) UIView *rightReticle;
 @property (nonatomic, strong) UIButton *quickSetupButton;
 @property (nonatomic, strong) UIButton *viewModeButton;
 @property (nonatomic, strong) CADisplayLink *displayLink;
 @property (nonatomic, strong) CIContext *ciContext;
-@property (nonatomic, strong) dispatch_queue_t visionQueue;
 @property (nonatomic, strong) dispatch_queue_t passthroughQueue;
 
 @property (nonatomic, copy) NSString *emailText;
@@ -244,74 +162,68 @@ namespace
 @property (nonatomic, strong) NSArray<NSDictionary *> *hosts;
 @property (nonatomic, assign) int hostWidth;
 @property (nonatomic, assign) int hostHeight;
+@property (nonatomic, assign) LoginField loginField;
 
-@property (nonatomic, assign) InputTarget inputTarget;
-@property (nonatomic, assign) int activeSideSlot;
-@property (nonatomic, assign) int screenSizePreset; // 0 = Big (1.15x), 1 = Giant (1.50x), 2 = IMAX (1.90x)
-@property (nonatomic, assign) int movingMonitorIndex; // -2 = none, -1 = main PC, 0..4 = side slot
+// VR Box optical & cinema settings
+@property (nonatomic, assign) float lensSpacingRatio;
+@property (nonatomic, assign) float eyeHeightRatio;
+@property (nonatomic, assign) float screenScale;
+@property (nonatomic, assign) float screenDistance;
+@property (nonatomic, assign) BOOL headLockMode;
 @property (nonatomic, assign) BOOL passthroughOn;
-@property (nonatomic, assign) BOOL singleScreenTouchMode;
-@property (nonatomic, assign) BOOL keyboardVisible;
-@property (nonatomic, assign) BOOL rightClickArmed;
-@property (nonatomic, assign) BOOL muted;
-@property (nonatomic, assign) BOOL shiftOn;
-@property (nonatomic, assign) BOOL ctrlOn;
-@property (nonatomic, assign) BOOL altOn;
-@property (nonatomic, assign) BOOL winOn;
-@property (nonatomic, assign) BOOL handTrackingEnabled;
-@property (nonatomic, assign) BOOL handAimEnabled;
-
-@property (nonatomic, copy) NSString *hoveredNodeKey;
-@property (nonatomic, copy) NSString *hoveredButtonId;
-@property (nonatomic, copy) NSString *flashedButtonId;
-@property (nonatomic, assign) CFTimeInterval flashUntil;
-@property (nonatomic, assign) CFTimeInterval nextWebSnapshotAt;
-@property (nonatomic, assign) CFTimeInterval nextPassthroughAt;
-@property (nonatomic, assign) CFTimeInterval nextVisionAt;
-@property (nonatomic, assign) CFTimeInterval lastPinchClickAt;
-
 @property (nonatomic, assign) BOOL passthroughBusy;
-@property (nonatomic, assign) BOOL visionBusy;
-@property (nonatomic, assign) BOOL handTracked;
-@property (nonatomic, assign) BOOL pinchClosed;
-@property (nonatomic, assign) BOOL fingerPoking;
-@property (nonatomic, assign) BOOL fingerPokePending;
-@property (nonatomic, assign) BOOL parsecMouseHeld;
-@property (nonatomic, assign) int heldParsecButton;
-@property (nonatomic, assign) BOOL isTwoFingerScrolling;
-@property (nonatomic, assign) CGFloat twoFingerScrollLastY;
+@property (nonatomic, assign) CFTimeInterval nextPassthroughAt;
+@property (nonatomic, assign) BOOL singleScreenTouchMode;
+@property (nonatomic, assign) BOOL muted;
+@property (nonatomic, assign) BOOL hasRecenteredOnce;
+
+// Xbox / MFi Controller state
+@property (nonatomic, strong) GCController *activeController;
+@property (nonatomic, assign) BOOL gamepadPassthroughMode;
+@property (nonatomic, assign) NSInteger selectedMenuIndex;
+@property (nonatomic, assign) CGPoint cursorUv;
 @property (nonatomic, assign) int lastMousePx;
 @property (nonatomic, assign) int lastMousePy;
-@property (nonatomic, assign) BOOL hasRecenteredOnce;
-@property (nonatomic, assign) int lastFocusedTargetIndex;
-@property (nonatomic, assign) BOOL palmOpenNow;
-@property (nonatomic, assign) CFTimeInterval palmFacingSince;
-@property (nonatomic, assign) CFTimeInterval palmMenuVisibleUntil;
-@property (nonatomic, assign) float grabBaseDistance;
-@property (nonatomic, assign) float grabInitialHandDepth;
-@property (nonatomic, assign) CFTimeInterval grabStartedAt;
-@property (nonatomic, assign) SCNVector3 grabSteadyPos;
-@property (nonatomic, assign) CFTimeInterval grabSteadySince;
-@property (nonatomic, assign) BOOL grabHasMovedSignificantly;
+@property (nonatomic, assign) BOOL parsecMouseHeld;
+@property (nonatomic, assign) int heldMouseButton;
+@property (nonatomic, assign) CFTimeInterval lastTickAt;
+@property (nonatomic, assign) CFTimeInterval nextNavRepeatAt;
+@property (nonatomic, assign) CFTimeInterval nextComboRepeatAt;
+@property (nonatomic, assign) CFTimeInterval nextBarRedrawAt;
+@property (nonatomic, assign) CFTimeInterval nextGamepadHeartbeatAt;
+@property (nonatomic, assign) CFTimeInterval barToastUntil;
+@property (nonatomic, copy) NSString *barToastText;
+@property (nonatomic, assign) uint16_t lastSentButtons;
+@property (nonatomic, assign) int16_t lastSentLX;
+@property (nonatomic, assign) int16_t lastSentLY;
+@property (nonatomic, assign) int16_t lastSentRX;
+@property (nonatomic, assign) int16_t lastSentRY;
+@property (nonatomic, assign) uint8_t lastSentLT;
+@property (nonatomic, assign) uint8_t lastSentRT;
+
+// Edge-trigger memory for UI / mouse mode controller buttons
+@property (nonatomic, assign) BOOL prevBtnA;
+@property (nonatomic, assign) BOOL prevBtnB;
+@property (nonatomic, assign) BOOL prevBtnX;
+@property (nonatomic, assign) BOOL prevBtnY;
+@property (nonatomic, assign) BOOL prevBtnLB;
+@property (nonatomic, assign) BOOL prevBtnRB;
+@property (nonatomic, assign) BOOL prevBtnMenu;
+@property (nonatomic, assign) BOOL suppressMenuUntilRelease;
+@property (nonatomic, assign) BOOL prevComboToggle;
+@property (nonatomic, assign) BOOL prevComboRecenter;
+@property (nonatomic, assign) BOOL prevDpadL;
+@property (nonatomic, assign) BOOL prevDpadR;
+@property (nonatomic, assign) BOOL prevDpadU;
+@property (nonatomic, assign) BOOL prevDpadD;
+@property (nonatomic, assign) BOOL isTwoFingerScrolling;
+@property (nonatomic, assign) CGFloat twoFingerScrollLastY;
 @end
 
 @implementation VRWorkspaceViewController
 {
     std::vector<VRButtonHit> _parsecPanelHits;
     std::vector<VRButtonHit> _parsecBarHits;
-    std::vector<VRButtonHit> _dockHits;
-    std::vector<VRButtonHit> _keyboardHits;
-    std::vector<VRButtonHit> _palmMenuHits;
-    SideMonitorSlot _sideSlots[kMaxWebMonitors];
-    SCNNode *_handJointNodes[kHandJointCount];
-    SCNNode *_handBoneNodes[kHandBoneCount];
-    SCNVector3 _targetHandJoints[kHandJointCount];
-    SCNVector3 _currentHandJoints[kHandJointCount];
-    float _targetHandDepth;
-    float _lastFacingCross;
-    CFTimeInterval _lastHandObsAt;
-    CFTimeInterval _handTurningUntil;
-    int _steadyHandFrames;
 }
 
 - (BOOL)prefersStatusBarHidden { return YES; }
@@ -329,45 +241,60 @@ namespace
     self.tfaText = @"";
     self.sessionId = @"";
     self.connectedHostName = @"";
-    self.parsecStateMessage = @"Sign in with your Parsec account or tap Parsec Setup.";
-    self.inputTarget = InputTarget::ParsecEmail;
-    self.activeSideSlot = 0;
-    self.screenSizePreset = 1; // Default to Giant monitors.
-    self.movingMonitorIndex = -2;
-    self.passthroughOn = YES; // GPU Metal passthrough active at startup so user sees their room.
-    self.handTrackingEnabled = YES; // Visible 3D hand skeleton, thumb-index pinch, and palm menu enabled.
-    self.handAimEnabled = NO; // Default to rock-solid 120 FPS Head Gaze aiming.
-    self.singleScreenTouchMode = NO;
-    self.keyboardVisible = YES;
+    self.parsecStateMessage = @"Sign in via Setup button or connect your Xbox controller.";
     self.hosts = @[];
     self.hostWidth = 1920;
     self.hostHeight = 1080;
-    self.lastFocusedTargetIndex = -1;
-    self.grabBaseDistance = kParsecDist;
-    self.heldParsecButton = 1;
+    self.loginField = LoginField::Email;
+    self.cursorUv = CGPointMake(0.5, 0.5);
     self.lastMousePx = -1;
     self.lastMousePy = -1;
+    self.heldMouseButton = 1;
+    self.selectedMenuIndex = 0;
+
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    float savedLens = [ud floatForKey:kPrefLensSpacing];
+    float savedEyeH = [ud floatForKey:kPrefEyeHeight];
+    float savedScale = [ud floatForKey:kPrefScreenScale];
+    float savedDist = [ud floatForKey:kPrefScreenDist];
+    self.lensSpacingRatio = (savedLens >= 0.28f && savedLens <= 0.50f) ? savedLens : kDefaultLensSpacing;
+    self.eyeHeightRatio = (savedEyeH >= 0.65f && savedEyeH <= 1.00f) ? savedEyeH : kDefaultEyeHeight;
+    self.screenScale = (savedScale >= 0.60f && savedScale <= 2.40f) ? savedScale : kDefaultScreenScale;
+    self.screenDistance = (savedDist >= 0.80f && savedDist <= 2.60f) ? savedDist : kDefaultScreenDist;
+
+    self.passthroughOn = NO; // Cinema Black gives razor-sharp contrast and ice-cold 120 FPS.
+    self.headLockMode = NO;  // World 6DoF locked by default; Y button recenters anytime.
 
     self.ciContext = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @NO}];
-    self.visionQueue = dispatch_queue_create("com.brenpoly.cardboardxr.vision", DISPATCH_QUEUE_SERIAL);
     self.passthroughQueue = dispatch_queue_create("com.brenpoly.cardboardxr.passthrough", DISPATCH_QUEUE_SERIAL);
 
     [self setupSceneAndStereoViews];
-    [self buildWorkspaceNodes];
-    [self setupGestureAndOverlay];
+    [self buildCinemaNodes];
+    [self setupOverlayViews];
     [self setupArSession];
+    [self setupGameControllers];
 
     VRParsecInit();
 
     [self restoreSavedSession];
-    [self applyMonitorSizes];
+    [self applyScreenLayoutAndScale];
     [self applyWorkspaceVisibility];
-    [self redrawAllUiPanels];
+    [self redrawAllPanels];
 
+    self.lastTickAt = CACurrentMediaTime();
     self.displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(onTick:)];
     if (@available(iOS 15.0, *))
         self.displayLink.preferredFrameRateRange = CAFrameRateRangeMake(80, 120, 120);
     [self.displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+}
+
+- (void)dealloc
+{
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
+    [self.displayLink invalidate];
+    [self.arSession pause];
+    VRParsecUnplugGamepad();
+    VRParsecDisconnect();
 }
 
 - (void)viewDidLayoutSubviews
@@ -376,67 +303,93 @@ namespace
     [self updateStereoOrFullLayout];
 }
 
+#pragma mark - VR Box Optical Viewport Layout
+
+- (void)saveVrBoxPreferences
+{
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setFloat:self.lensSpacingRatio forKey:kPrefLensSpacing];
+    [ud setFloat:self.eyeHeightRatio forKey:kPrefEyeHeight];
+    [ud setFloat:self.screenScale forKey:kPrefScreenScale];
+    [ud setFloat:self.screenDistance forKey:kPrefScreenDist];
+}
+
 - (void)updateStereoOrFullLayout
 {
     CGRect bounds = self.view.bounds;
+    CGFloat W = bounds.size.width;
+    CGFloat H = bounds.size.height;
+    if (W <= 0 || H <= 0)
+        return;
+
     if (self.singleScreenTouchMode)
     {
         self.leftView.frame = bounds;
         self.rightView.hidden = YES;
         self.rightView.rendersContinuously = NO;
+        self.dividerLine.hidden = YES;
         self.leftReticle.hidden = YES;
         self.rightReticle.hidden = YES;
+        self.quickSetupButton.alpha = 0.92;
+        self.viewModeButton.alpha = 0.92;
         return;
     }
 
     self.rightView.hidden = NO;
     self.rightView.rendersContinuously = YES;
-    self.leftReticle.hidden = NO;
-    self.rightReticle.hidden = NO;
+    self.dividerLine.hidden = NO;
 
-    CGFloat halfW = bounds.size.width * 0.5;
-    self.leftView.frame = CGRectMake(0, 0, halfW - 1.0, bounds.size.height);
-    self.rightView.frame = CGRectMake(halfW + 1.0, 0, halfW - 1.0, bounds.size.height);
+    CGFloat midX = W * 0.5;
+    CGFloat eyeW = floor(W * self.lensSpacingRatio);
+    CGFloat eyeH = floor(H * self.eyeHeightRatio);
+    CGFloat eyeY = floor((H - eyeH) * 0.5);
 
-    CGFloat rSize = 10.0;
-    self.leftReticle.center = CGPointMake(halfW * 0.5, bounds.size.height * 0.5);
+    self.leftView.frame = CGRectMake(midX - eyeW - 1.0, eyeY, eyeW, eyeH);
+    self.rightView.frame = CGRectMake(midX + 1.0, eyeY, eyeW, eyeH);
+    self.dividerLine.frame = CGRectMake(midX - 0.5, 0.0, 1.0, H);
+
+    BOOL showReticles = !self.parsecConnected;
+    self.leftReticle.hidden = !showReticles;
+    self.rightReticle.hidden = !showReticles;
+
+    CGFloat rSize = 8.0;
+    self.leftReticle.center = CGPointMake(midX - 1.0 - eyeW * 0.5, H * 0.5);
     self.leftReticle.bounds = CGRectMake(0, 0, rSize, rSize);
-    self.rightReticle.center = CGPointMake(halfW + halfW * 0.5, bounds.size.height * 0.5);
+    self.rightReticle.center = CGPointMake(midX + 1.0 + eyeW * 0.5, H * 0.5);
     self.rightReticle.bounds = CGRectMake(0, 0, rSize, rSize);
+
+    // Subtle in VR Box so corners stay clean behind lens edge.
+    self.quickSetupButton.alpha = 0.28;
+    self.viewModeButton.alpha = 0.28;
 }
 
-- (void)dealloc
-{
-    [self.displayLink invalidate];
-    [self.arSession pause];
-    VRParsecDisconnect();
-    VRWebDestroyAll();
-}
+#pragma mark - Scene & Cinema Nodes
 
 - (void)setupSceneAndStereoViews
 {
     self.scene = [SCNScene scene];
-    self.scene.background.contents = ColorHex(0x141218);
+    self.scene.background.contents = [UIColor blackColor];
 
     self.headNode = [SCNNode node];
     [self.scene.rootNode addChildNode:self.headNode];
 
+    // Zero-disparity MonoEyes optical axis prevents double vision on flat cinema screen inside VR Box lenses.
     SCNCamera *leftCam = [SCNCamera camera];
     leftCam.zNear = 0.05;
-    leftCam.zFar = 60.0;
-    leftCam.fieldOfView = 76.0;
+    leftCam.zFar = 50.0;
+    leftCam.fieldOfView = kDefaultFov;
     self.leftEyeNode = [SCNNode node];
     self.leftEyeNode.camera = leftCam;
-    self.leftEyeNode.position = SCNVector3Make(-kEyeSeparation * 0.5f, 0, 0);
+    self.leftEyeNode.position = SCNVector3Zero;
     [self.headNode addChildNode:self.leftEyeNode];
 
     SCNCamera *rightCam = [SCNCamera camera];
     rightCam.zNear = 0.05;
-    rightCam.zFar = 60.0;
-    rightCam.fieldOfView = 76.0;
+    rightCam.zFar = 50.0;
+    rightCam.fieldOfView = kDefaultFov;
     self.rightEyeNode = [SCNNode node];
     self.rightEyeNode.camera = rightCam;
-    self.rightEyeNode.position = SCNVector3Make(kEyeSeparation * 0.5f, 0, 0);
+    self.rightEyeNode.position = SCNVector3Zero;
     [self.headNode addChildNode:self.rightEyeNode];
 
     self.leftView = [[SCNView alloc] initWithFrame:CGRectZero];
@@ -482,256 +435,84 @@ namespace
     return [[UIGraphicsImageRenderer alloc] initWithSize:sz format:fmt];
 }
 
-- (UIImage *)createFloorGridImage
+- (void)buildCinemaNodes
 {
-    CGSize sz = CGSizeMake(256, 256);
-    UIGraphicsImageRenderer *r = [self makeUiRendererWithSize:sz];
-    return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        [ColorHex(0x0E1018) setFill];
-        [ctx fillRect:CGRectMake(0, 0, 256, 256)];
-        [ColorHex(0x374B6E) setFill];
-        [ctx fillRect:CGRectMake(0, 0, 256, 4)];
-        [ctx fillRect:CGRectMake(0, 0, 4, 256)];
-    }];
-}
+    self.cinemaRootNode = [SCNNode node];
+    [self.scene.rootNode addChildNode:self.cinemaRootNode];
 
-- (void)buildWorkspaceNodes
-{
-    self.workspaceRoot = [SCNNode node];
-    [self.scene.rootNode addChildNode:self.workspaceRoot];
-
-    SCNPlane *floorGeo = [SCNPlane planeWithWidth:16.0 height:16.0];
+    SCNPlane *floorGeo = [SCNPlane planeWithWidth:20.0 height:20.0];
     SCNMaterial *floorMat = [SCNMaterial material];
     floorMat.lightingModelName = SCNLightingModelConstant;
-    floorMat.diffuse.contents = [self createFloorGridImage];
-    floorMat.diffuse.wrapS = SCNWrapModeRepeat;
-    floorMat.diffuse.wrapT = SCNWrapModeRepeat;
-    floorMat.diffuse.contentsTransform = SCNMatrix4MakeScale(16, 16, 1);
+    floorMat.diffuse.contents = ColorHex(0x060609);
     floorGeo.materials = @[floorMat];
     self.floorNode = [SCNNode nodeWithGeometry:floorGeo];
-    self.floorNode.position = SCNVector3Make(0, -1.6f, 0);
+    self.floorNode.position = SCNVector3Make(0, -1.75f, 0);
     self.floorNode.eulerAngles = SCNVector3Make(-M_PI_2, 0, 0);
-    self.floorNode.hidden = self.passthroughOn;
-    [self.workspaceRoot addChildNode:self.floorNode];
+    self.floorNode.hidden = YES;
+    [self.cinemaRootNode addChildNode:self.floorNode];
 
-    self.mainAnchorNode = [SCNNode node];
-    self.mainAnchorNode.position = SCNVector3Make(0, 0.42f, -kParsecDist);
-    self.mainAnchorNode.eulerAngles = SCNVector3Make(4.0f * M_PI / 180.0f, 0, 0);
-    [self.workspaceRoot addChildNode:self.mainAnchorNode];
+    self.screenAnchorNode = [SCNNode node];
+    self.screenAnchorNode.position = SCNVector3Make(0, 0.0f, -self.screenDistance);
+    [self.cinemaRootNode addChildNode:self.screenAnchorNode];
 
-    self.parsecScreenNode = [self makePlaneNode:@"parsec_screen" width:2.20 height:1.24 color:ColorHex(0x18171D)];
-    [self.mainAnchorNode addChildNode:self.parsecScreenNode];
+    self.parsecScreenNode = [self makePlaneNode:@"parsec_screen" width:kBaseScreenWidth height:(kBaseScreenWidth * 9.0 / 16.0) color:ColorHex(0x101014)];
+    [self.screenAnchorNode addChildNode:self.parsecScreenNode];
 
-    self.parsecPanelNode = [self makePlaneNode:@"parsec_panel" width:1.28 height:0.84 color:ColorHex(0x211F26)];
-    [self.mainAnchorNode addChildNode:self.parsecPanelNode];
+    self.parsecPanelNode = [self makePlaneNode:@"parsec_panel" width:1.36 height:0.96 color:ColorHex(0x1D1B22)];
+    [self.screenAnchorNode addChildNode:self.parsecPanelNode];
 
-    self.parsecBarNode = [self makePlaneNode:@"parsec_bar" width:1.60 height:0.16 color:ColorHex(0x211F26)];
-    self.parsecBarNode.position = SCNVector3Make(0, 0.72f, 0.01f);
-    [self.mainAnchorNode addChildNode:self.parsecBarNode];
+    self.parsecBarNode = [self makePlaneNode:@"parsec_bar" width:1.96 height:0.26 color:ColorHex(0x1D1B22)];
+    self.parsecBarNode.position = SCNVector3Make(0, -1.16f, 0.02f);
+    [self.screenAnchorNode addChildNode:self.parsecBarNode];
 
-    self.mainGrabNode = [self makePlaneNode:@"grab_main" width:0.76 height:0.09 color:ColorHex(0x4A4458)];
-    self.mainGrabNode.position = SCNVector3Make(0, -0.69f, 0.01f);
-    [self.mainAnchorNode addChildNode:self.mainGrabNode];
-
-    self.keyboardNode = [self makePlaneNode:@"keyboard" width:0.84 height:0.35 color:ColorHex(0x211F26)];
-    self.keyboardNode.position = SCNVector3Make(0, -0.48f, -kKeyboardDist);
-    self.keyboardNode.eulerAngles = SCNVector3Make(kKeyboardPitchDeg * M_PI / 180.0f, 0, 0);
-    [self.workspaceRoot addChildNode:self.keyboardNode];
-
-    self.keyboardGrabNode = [self makePlaneNode:@"grab_kb" width:0.42 height:0.055 color:ColorHex(0x4A4458)];
-    self.keyboardGrabNode.position = SCNVector3Make(0, 0.21f, 0.005f);
-    [self.keyboardNode addChildNode:self.keyboardGrabNode];
-
-    self.dockNode = [self makePlaneNode:@"dock" width:1.20 height:0.18 color:ColorHex(0x211F26)];
-    self.dockNode.position = SCNVector3Make(0, -0.78f, -0.62f);
-    self.dockNode.eulerAngles = SCNVector3Make(-34.0f * M_PI / 180.0f, 0, 0);
-    [self.workspaceRoot addChildNode:self.dockNode];
-
-    self.dockGrabNode = [self makePlaneNode:@"grab_dock" width:0.42 height:0.05 color:ColorHex(0x4A4458)];
-    self.dockGrabNode.position = SCNVector3Make(0, 0.125f, 0.005f);
-    [self.dockNode addChildNode:self.dockGrabNode];
-
-    self.palmMenuNode = [self makePlaneNode:@"palm_menu" width:0.42 height:0.26 color:ColorHex(0x211F26)];
-    self.palmMenuNode.renderingOrder = 30;
-    self.palmMenuNode.hidden = YES;
-    [self.headNode addChildNode:self.palmMenuNode];
-
-    SCNPlane *hoverPlane = [SCNPlane planeWithWidth:1.0 height:1.0];
-    hoverPlane.cornerRadius = 0.08;
-    SCNMaterial *hoverMat = [SCNMaterial material];
-    hoverMat.lightingModelName = SCNLightingModelConstant;
-    hoverMat.diffuse.contents = ColorHex(0xD0BCFF, 0.28);
-    hoverMat.writesToDepthBuffer = NO;
-    hoverPlane.materials = @[hoverMat];
-    self.hoverHighlightNode = [SCNNode nodeWithGeometry:hoverPlane];
-    self.hoverHighlightNode.renderingOrder = 10;
-    self.hoverHighlightNode.hidden = YES;
-
-    SCNSphere *cGeo = [SCNSphere sphereWithRadius:0.014];
+    SCNSphere *cGeo = [SCNSphere sphereWithRadius:0.016];
     SCNMaterial *cMat = [SCNMaterial material];
     cMat.lightingModelName = SCNLightingModelConstant;
-    cMat.diffuse.contents = ColorHex(0xD0BCFF);
+    cMat.diffuse.contents = ColorHex(0x5EEAD4, 0.96);
+    cMat.writesToDepthBuffer = NO;
     cGeo.materials = @[cMat];
     self.parsecCursorNode = [SCNNode nodeWithGeometry:cGeo];
+    self.parsecCursorNode.renderingOrder = 25;
     self.parsecCursorNode.hidden = YES;
     [self.parsecScreenNode addChildNode:self.parsecCursorNode];
+}
 
-    struct SlotDefaults { float yawDeg; float pitchDeg; float dist; BOOL startOn; const char *url; };
-    const SlotDefaults defs[kMaxWebMonitors] = {
-        {-54.0f,  4.0f, 1.40f, NO, "https://www.youtube.com"},
-        { 54.0f,  4.0f, 1.40f, NO, "https://duckduckgo.com"},
-        {  0.0f, 34.0f, 1.44f, NO, "https://discord.com/app"},
-        {-96.0f,  4.0f, 1.40f, NO, "https://chatgpt.com"},
-        { 96.0f,  4.0f, 1.40f, NO, "https://github.com"},
+- (void)setupOverlayViews
+{
+    self.dividerLine = [[UIView alloc] initWithFrame:CGRectZero];
+    self.dividerLine.backgroundColor = ColorHex(0xFFFFFF, 0.25);
+    self.dividerLine.userInteractionEnabled = NO;
+    [self.view addSubview:self.dividerLine];
+
+    auto makeReticle = ^UIView *() {
+        UIView *v = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 8, 8)];
+        v.layer.cornerRadius = 4.0;
+        v.layer.borderWidth = 1.5;
+        v.layer.borderColor = [UIColor whiteColor].CGColor;
+        v.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.35];
+        v.userInteractionEnabled = NO;
+        return v;
     };
-
-    for (int i = 0; i < kMaxWebMonitors; ++i)
-    {
-        SideMonitorSlot &slot = _sideSlots[i];
-        slot.index = i;
-        slot.active = defs[i].startOn;
-        slot.useParsecStream2 = NO;
-        slot.defaultYawDeg = defs[i].yawDeg;
-        slot.defaultPitchDeg = defs[i].pitchDeg;
-        slot.defaultDist = defs[i].dist;
-        slot.urlText = [NSString stringWithUTF8String:defs[i].url];
-
-        slot.anchorNode = [SCNNode node];
-        [self.workspaceRoot addChildNode:slot.anchorNode];
-
-        slot.screenNode = [self makePlaneNode:[NSString stringWithFormat:@"side_screen_%d", i]
-                                        width:1.80 height:1.08 color:ColorHex(0x18171D)];
-        [slot.anchorNode addChildNode:slot.screenNode];
-
-        slot.barNode = [self makePlaneNode:[NSString stringWithFormat:@"side_bar_%d", i]
-                                     width:1.80 height:0.24 color:ColorHex(0x211F26)];
-        slot.barNode.position = SCNVector3Make(0, 0.68f, 0.01f);
-        [slot.anchorNode addChildNode:slot.barNode];
-
-        slot.grabNode = [self makePlaneNode:[NSString stringWithFormat:@"grab_side_%d", i]
-                                      width:0.64 height:0.08 color:ColorHex(0x4A4458)];
-        slot.grabNode.position = SCNVector3Make(0, -0.61f, 0.01f);
-        [slot.anchorNode addChildNode:slot.grabNode];
-
-        slot.cursorNode = [SCNNode nodeWithGeometry:cGeo];
-        slot.cursorNode.hidden = YES;
-        [slot.screenNode addChildNode:slot.cursorNode];
-
-        [self resetSideSlotPose:i];
-    }
-
-    SCNSphere *jointGeo = [SCNSphere sphereWithRadius:0.0065];
-    SCNMaterial *jointMat = [SCNMaterial material];
-    jointMat.lightingModelName = SCNLightingModelConstant;
-    jointMat.diffuse.contents = ColorHex(0xD0BCFF, 0.92);
-    jointGeo.materials = @[jointMat];
-
-    SCNSphere *tipGeo = [SCNSphere sphereWithRadius:0.011];
-    self.indexTipMat = [SCNMaterial material];
-    self.indexTipMat.lightingModelName = SCNLightingModelConstant;
-    self.indexTipMat.diffuse.contents = ColorHex(0x5EEAD4, 0.96);
-    tipGeo.materials = @[self.indexTipMat];
-
-    for (int i = 0; i < kHandJointCount; ++i)
-    {
-        SCNNode *jn = [SCNNode nodeWithGeometry:((i == 4 || i == 8) ? tipGeo : jointGeo)];
-        jn.hidden = YES;
-        jn.renderingOrder = 25;
-        [self.headNode addChildNode:jn];
-        _handJointNodes[i] = jn;
-        _targetHandJoints[i] = SCNVector3Zero;
-        _currentHandJoints[i] = SCNVector3Zero;
-    }
-
-    SCNCylinder *boneGeo = [SCNCylinder cylinderWithRadius:0.0032 height:1.0];
-    SCNMaterial *boneMat = [SCNMaterial material];
-    boneMat.lightingModelName = SCNLightingModelConstant;
-    boneMat.diffuse.contents = ColorHex(0xE8DEF8, 0.78);
-    boneGeo.materials = @[boneMat];
-
-    for (int b = 0; b < kHandBoneCount; ++b)
-    {
-        SCNNode *bn = [SCNNode nodeWithGeometry:boneGeo];
-        bn.hidden = YES;
-        bn.renderingOrder = 24;
-        [self.headNode addChildNode:bn];
-        _handBoneNodes[b] = bn;
-    }
-
-    SCNCylinder *rayGeo = [SCNCylinder cylinderWithRadius:0.0022 height:1.0];
-    SCNMaterial *rayMat = [SCNMaterial material];
-    rayMat.lightingModelName = SCNLightingModelConstant;
-    rayMat.diffuse.contents = ColorHex(0x5EEAD4, 0.55);
-    rayMat.writesToDepthBuffer = NO;
-    rayGeo.materials = @[rayMat];
-    self.handRayNode = [SCNNode nodeWithGeometry:rayGeo];
-    self.handRayNode.hidden = YES;
-    self.handRayNode.renderingOrder = 23;
-    [self.headNode addChildNode:self.handRayNode];
-}
-
-- (void)resetSideSlotPose:(int)i
-{
-    if (i < 0 || i >= kMaxWebMonitors) return;
-    SideMonitorSlot &slot = _sideSlots[i];
-    float yaw = slot.defaultYawDeg * M_PI / 180.0f;
-    float pitch = slot.defaultPitchDeg * M_PI / 180.0f;
-    float cosP = cosf(pitch);
-    float x = -sinf(yaw) * cosP * slot.defaultDist;
-    float y = 0.42f + sinf(pitch) * slot.defaultDist;
-    float z = -cosf(yaw) * cosP * slot.defaultDist;
-    slot.anchorNode.position = SCNVector3Make(x, y, z);
-    slot.anchorNode.eulerAngles = SCNVector3Make(-pitch, yaw, 0);
-}
-
-- (float)currentMonitorScale
-{
-    if (self.screenSizePreset == 0) return 1.05f;
-    if (self.screenSizePreset == 1) return 1.30f;
-    return 1.60f;
-}
-
-- (void)applyMonitorSizes
-{
-    float s = [self currentMonitorScale];
-    self.mainAnchorNode.scale = SCNVector3Make(s, s, 1.0f);
-    for (int i = 0; i < kMaxWebMonitors; ++i)
-        _sideSlots[i].anchorNode.scale = SCNVector3Make(s, s, 1.0f);
-}
-
-- (void)setupGestureAndOverlay
-{
-    self.leftReticle = [[UIView alloc] init];
-    self.leftReticle.userInteractionEnabled = NO;
-    self.leftReticle.layer.cornerRadius = 5.0;
-    self.leftReticle.layer.borderWidth = 1.8;
-    self.leftReticle.layer.borderColor = [UIColor whiteColor].CGColor;
-    self.leftReticle.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.25];
+    self.leftReticle = makeReticle();
+    self.rightReticle = makeReticle();
     [self.view addSubview:self.leftReticle];
-
-    self.rightReticle = [[UIView alloc] init];
-    self.rightReticle.userInteractionEnabled = NO;
-    self.rightReticle.layer.cornerRadius = 5.0;
-    self.rightReticle.layer.borderWidth = 1.8;
-    self.rightReticle.layer.borderColor = [UIColor whiteColor].CGColor;
-    self.rightReticle.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.25];
     [self.view addSubview:self.rightReticle];
 
     self.quickSetupButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.quickSetupButton.frame = CGRectMake(18, 16, 124, 34);
-    self.quickSetupButton.backgroundColor = ColorHex(0x211F26, 0.88);
-    self.quickSetupButton.layer.cornerRadius = 17.0;
+    self.quickSetupButton.frame = CGRectMake(14, 14, 140, 32);
+    self.quickSetupButton.backgroundColor = ColorHex(0x2B2930, 0.88);
+    self.quickSetupButton.layer.cornerRadius = 16;
     [self.quickSetupButton setTitle:@"Parsec Setup" forState:UIControlStateNormal];
-    [self.quickSetupButton setTitleColor:ColorHex(0xD0BCFF) forState:UIControlStateNormal];
+    [self.quickSetupButton setTitleColor:ColorHex(0xE6E0E9) forState:UIControlStateNormal];
     self.quickSetupButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
     [self.quickSetupButton addTarget:self action:@selector(openQuickSetupAlert) forControlEvents:UIControlEventTouchUpInside];
     [self.view addSubview:self.quickSetupButton];
 
     self.viewModeButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.viewModeButton.frame = CGRectMake(150, 16, 138, 34);
-    self.viewModeButton.backgroundColor = ColorHex(0x211F26, 0.88);
-    self.viewModeButton.layer.cornerRadius = 17.0;
-    [self.viewModeButton setTitle:@"View: VR Split" forState:UIControlStateNormal];
+    self.viewModeButton.frame = CGRectMake(162, 14, 130, 32);
+    self.viewModeButton.backgroundColor = ColorHex(0x2B2930, 0.88);
+    self.viewModeButton.layer.cornerRadius = 16;
+    [self.viewModeButton setTitle:@"View: VR Box" forState:UIControlStateNormal];
     [self.viewModeButton setTitleColor:ColorHex(0xD0BCFF) forState:UIControlStateNormal];
     self.viewModeButton.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
     [self.viewModeButton addTarget:self action:@selector(toggleSingleScreenTouchMode) forControlEvents:UIControlEventTouchUpInside];
@@ -741,9 +522,29 @@ namespace
 - (void)toggleSingleScreenTouchMode
 {
     self.singleScreenTouchMode = !self.singleScreenTouchMode;
-    [self.viewModeButton setTitle:(self.singleScreenTouchMode ? @"View: Full Touch" : @"View: VR Split") forState:UIControlStateNormal];
+    [self.viewModeButton setTitle:(self.singleScreenTouchMode ? @"View: Full 2D" : @"View: VR Box") forState:UIControlStateNormal];
     [self updateStereoOrFullLayout];
 }
+
+- (void)applyScreenLayoutAndScale
+{
+    double aspect = (self.hostWidth > 0 && self.hostHeight > 0)
+        ? (static_cast<double>(self.hostHeight) / static_cast<double>(self.hostWidth))
+        : (9.0 / 16.0);
+    aspect = std::max(0.32, std::min(1.0, aspect));
+
+    CGFloat w = kBaseScreenWidth * self.screenScale;
+    CGFloat h = w * aspect;
+    SCNPlane *pl = (SCNPlane *)self.parsecScreenNode.geometry;
+    pl.width = w;
+    pl.height = h;
+
+    self.screenAnchorNode.position = SCNVector3Make(0, 0.0f, -self.screenDistance);
+    CGFloat barY = -h * 0.5 - 0.17;
+    self.parsecBarNode.position = SCNVector3Make(0, static_cast<float>(barY), 0.02f);
+}
+
+#pragma mark - ARKit 120Hz Head Tracking + Optional Passthrough
 
 - (void)setupArSession
 {
@@ -777,38 +578,23 @@ namespace
         [self recenterWorkspace];
     }
 
-    CFTimeInterval now = CACurrentMediaTime();
-    if (self.passthroughOn && !self.passthroughBusy && now >= self.nextPassthroughAt)
+    if (self.passthroughOn && !self.passthroughBusy)
     {
-        self.nextPassthroughAt = now + (1.0 / 30.0);
-        self.passthroughBusy = YES;
-        CVPixelBufferRef pb = CVPixelBufferRetain(frame.capturedImage);
-        __weak VRWorkspaceViewController *weakSelf = self;
-        dispatch_async(self.passthroughQueue, ^{
-            VRWorkspaceViewController *strongSelf = weakSelf;
-            if (strongSelf)
-                [strongSelf updatePassthroughBackground:pb orientation:orient];
-            else
-                CVPixelBufferRelease(pb);
-        });
-    }
-
-    if (self.handTrackingEnabled && !self.visionBusy && now >= self.nextVisionAt)
-    {
-        self.nextVisionAt = now + (1.0 / 20.0);
-        self.visionBusy = YES;
-        CVPixelBufferRef pb = CVPixelBufferRetain(frame.capturedImage);
-        CGImagePropertyOrientation cgOrient = (orient == UIInterfaceOrientationLandscapeLeft)
-            ? kCGImagePropertyOrientationDown
-            : kCGImagePropertyOrientationUp;
-
-        __weak VRWorkspaceViewController *weakSelf = self;
-        dispatch_async(self.visionQueue, ^{
-            VRWorkspaceViewController *strongSelf = weakSelf;
-            if (strongSelf)
-                [strongSelf processHandPoseOnBuffer:pb orientation:cgOrient];
-            CVPixelBufferRelease(pb);
-        });
+        CFTimeInterval now = CACurrentMediaTime();
+        if (now >= self.nextPassthroughAt)
+        {
+            self.nextPassthroughAt = now + (1.0 / 30.0);
+            self.passthroughBusy = YES;
+            CVPixelBufferRef pb = CVPixelBufferRetain(frame.capturedImage);
+            __weak VRWorkspaceViewController *weakSelf = self;
+            dispatch_async(self.passthroughQueue, ^{
+                VRWorkspaceViewController *strongSelf = weakSelf;
+                if (strongSelf)
+                    [strongSelf updatePassthroughBackground:pb orientation:orient];
+                else
+                    CVPixelBufferRelease(pb);
+            });
+        }
     }
 }
 
@@ -855,447 +641,492 @@ namespace
     });
 }
 
-- (void)processHandPoseOnBuffer:(CVPixelBufferRef)pixelBuffer orientation:(CGImagePropertyOrientation)orient
+#pragma mark - Xbox / MFi Controller Engine
+
+- (void)setupGameControllers
 {
-    VNDetectHumanHandPoseRequest *req = [[VNDetectHumanHandPoseRequest alloc] init];
-    req.maximumHandCount = 1;
-    VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCVPixelBuffer:pixelBuffer orientation:orient options:@{}];
-    NSError *err = nil;
-    BOOL ok = [handler performRequests:@[req] error:&err];
-    VNHumanHandPoseObservation *obs = ok ? req.results.firstObject : nil;
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onControllerConnected:)
+                                                 name:GCControllerDidConnectNotification
+                                               object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                             selector:@selector(onControllerDisconnected:)
+                                                 name:GCControllerDidDisconnectNotification
+                                               object:nil];
+    [GCController startWirelessControllerDiscoveryWithCompletionHandler:nil];
+    [self refreshActiveController];
+}
 
-    BOOL tracked = NO;
-    BOOL palmOpen = NO;
-    BOOL hasPinchJoints = NO;
-    float estDepth = 0.45f;
-    float facingCross = 0.0f;
-    float pinchRatio = 1.0f;
-    std::vector<SCNVector3> parsedJoints(kHandJointCount, SCNVector3Zero);
+- (void)onControllerConnected:(NSNotification *)note
+{
+    (void)note;
+    [self refreshActiveController];
+    [self showBarToast:@"Xbox Kolu Baglandi!"];
+    [self redrawAllPanels];
+}
 
-    if (obs)
+- (void)onControllerDisconnected:(NSNotification *)note
+{
+    (void)note;
+    if (self.parsecConnected && self.gamepadPassthroughMode)
     {
-        NSArray<VNHumanHandPoseObservationJointName> *names = OrderedHandJointNames();
-        float ptX[kHandJointCount] = {};
-        float ptY[kHandJointCount] = {};
-        BOOL valid[kHandJointCount] = {};
+        VRParsecSendGamepadState(0, 0, 0, 0, 0, 0, 0);
+        VRParsecUnplugGamepad();
+    }
+    [self refreshActiveController];
+    [self showBarToast:@"Xbox Kolu Baglantisi Kesildi"];
+    [self redrawAllPanels];
+}
 
-        for (int i = 0; i < kHandJointCount; ++i)
+- (void)refreshActiveController
+{
+    GCController *picked = nil;
+    for (GCController *c in [GCController controllers])
+    {
+        if (c.extendedGamepad)
         {
-            VNRecognizedPoint *jp = [obs recognizedPointForJointName:names[i] error:nil];
-            if (jp && jp.confidence > 0.25f)
-            {
-                ptX[i] = static_cast<float>(jp.location.x);
-                ptY[i] = static_cast<float>(jp.location.y);
-                valid[i] = YES;
-            }
-        }
-
-        if (valid[0] && valid[8])
-        {
-            tracked = YES;
-            hasPinchJoints = (valid[0] && valid[4] && valid[5] && valid[8]);
-            for (int i = 1; i < kHandJointCount; ++i)
-            {
-                if (!valid[i])
-                {
-                    int fallback = (i <= 4 || i == 5 || i == 9 || i == 13 || i == 17) ? 0 : (i - 1);
-                    ptX[i] = valid[fallback] ? ptX[fallback] : ptX[0];
-                    ptY[i] = valid[fallback] ? ptY[fallback] : ptY[0];
-                }
-            }
-
-            float p9x = valid[9] ? ptX[9] : ptX[5];
-            float p9y = valid[9] ? ptY[9] : ptY[5];
-            float palmSpan = hypotf((p9x - ptX[0]) * 1.55f, (p9y - ptY[0]));
-            float knuckSpan = (valid[5] && valid[17]) ? hypotf((ptX[17] - ptX[5]) * 1.55f, (ptY[17] - ptY[5])) : palmSpan;
-            float palmNorm = std::max(0.045f, std::max(palmSpan, knuckSpan));
-            estDepth = std::max(0.22f, std::min(0.75f, 0.105f / palmNorm));
-
-            if (hasPinchJoints)
-            {
-                float tipGap = hypotf((ptX[8] - ptX[4]) * 1.55f, (ptY[8] - ptY[4]));
-                pinchRatio = tipGap / palmNorm;
-            }
-
-            if (valid[5] && valid[17])
-            {
-                float ix = ptX[5] - ptX[0], iy = ptY[5] - ptY[0];
-                float px = ptX[17] - ptX[0], py = ptY[17] - ptY[0];
-                float il = hypotf(ix, iy), pl = hypotf(px, py);
-                facingCross = (il > 1e-4f && pl > 1e-4f) ? ((ix * py - iy * px) / (il * pl)) : 0.0f;
-                float facingSin = fabsf(facingCross);
-
-                if (valid[12] && valid[16] && valid[20])
-                {
-                    float dMid = hypotf(ptX[12] - ptX[0], ptY[12] - ptY[0]);
-                    float dRing = hypotf(ptX[16] - ptX[0], ptY[16] - ptY[0]);
-                    float dPink = hypotf(ptX[20] - ptX[0], ptY[20] - ptY[0]);
-                    float dIdx = hypotf(ptX[8] - ptX[0], ptY[8] - ptY[0]);
-                    float baseSpan = std::max(0.03f, hypotf(p9x - ptX[0], p9y - ptY[0]));
-                    float openRatio = ((dIdx + dMid + dRing + dPink) * 0.25f) / baseSpan;
-                    palmOpen = (facingSin >= 0.35f && openRatio >= 1.48f);
-                }
-            }
-
-            for (int i = 0; i < kHandJointCount; ++i)
-            {
-                float nx = (ptX[i] - 0.5f) * 2.0f;
-                float ny = (ptY[i] - 0.5f) * 2.0f;
-                float zJ = estDepth;
-                if (i >= 5 && i <= 8)
-                    zJ -= 0.008f * static_cast<float>(i - 5);
-                parsedJoints[i] = SCNVector3Make(nx * 0.68f * zJ, ny * 0.42f * zJ, -zJ);
-            }
+            picked = c;
+            break;
         }
     }
-
-    __weak VRWorkspaceViewController *weakSelf = self;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        VRWorkspaceViewController *strongSelf = weakSelf;
-        if (!strongSelf)
-            return;
-
-        CFTimeInterval now = CACurrentMediaTime();
-        strongSelf.handTracked = tracked;
-        strongSelf.palmOpenNow = palmOpen;
-
-        if (tracked)
-        {
-            for (int i = 0; i < kHandJointCount; ++i)
-                strongSelf->_targetHandJoints[i] = parsedJoints[i];
-            strongSelf->_targetHandDepth = estDepth;
-
-            strongSelf->_steadyHandFrames = hasPinchJoints ? std::min(10, strongSelf->_steadyHandFrames + 1) : 0;
-
-            CFTimeInterval dt = (strongSelf->_lastHandObsAt > 0.0) ? (now - strongSelf->_lastHandObsAt) : 0.05;
-            strongSelf->_lastHandObsAt = now;
-            if (dt > 1e-3 && dt < 0.5)
-            {
-                float turnRate = fabsf(facingCross - strongSelf->_lastFacingCross) / static_cast<float>(dt);
-                if (turnRate > 1.8f)
-                    strongSelf->_handTurningUntil = now + 0.24;
-            }
-            strongSelf->_lastFacingCross = facingCross;
-
-            BOOL wantPinch = strongSelf.pinchClosed
-                ? (hasPinchJoints && pinchRatio < 0.72f)
-                : (hasPinchJoints && !palmOpen && pinchRatio < 0.38f &&
-                   now >= strongSelf->_handTurningUntil && strongSelf->_steadyHandFrames >= 2);
-
-            if (wantPinch && !strongSelf.pinchClosed)
-            {
-                strongSelf.pinchClosed = YES;
-                strongSelf.fingerPoking = YES;
-                strongSelf.fingerPokePending = YES;
-            }
-            else if (!wantPinch && strongSelf.pinchClosed)
-            {
-                strongSelf.pinchClosed = NO;
-                strongSelf.fingerPoking = NO;
-                [strongSelf handlePrimaryActionUp];
-                if (strongSelf.movingMonitorIndex != -2 && (now - strongSelf.grabStartedAt) >= 0.35)
-                    [strongSelf finishGrabAtCurrentPose];
-            }
-
-            if (palmOpen && !strongSelf.pinchClosed && strongSelf.movingMonitorIndex == -2)
-            {
-                if (strongSelf.palmFacingSince <= 0.0)
-                    strongSelf.palmFacingSince = now;
-                else if ((now - strongSelf.palmFacingSince) >= 0.32)
-                    strongSelf.palmMenuVisibleUntil = now + 5.0;
-            }
-            else
-            {
-                strongSelf.palmFacingSince = 0.0;
-            }
-        }
-        else
-        {
-            strongSelf->_steadyHandFrames = 0;
-            strongSelf->_lastHandObsAt = 0.0;
-            strongSelf.palmFacingSince = 0.0;
-            if (strongSelf.pinchClosed)
-            {
-                strongSelf.pinchClosed = NO;
-                strongSelf.fingerPoking = NO;
-                [strongSelf handlePrimaryActionUp];
-            }
-        }
-        strongSelf.visionBusy = NO;
-    });
+    self.activeController = picked;
+    if (picked)
+        picked.playerIndex = GCControllerPlayerIndex1;
 }
 
-- (void)hideHandSkeleton
+- (void)showBarToast:(NSString *)text
 {
-    for (int i = 0; i < kHandJointCount; ++i)
-        _handJointNodes[i].hidden = YES;
-    for (int b = 0; b < kHandBoneCount; ++b)
-        _handBoneNodes[b].hidden = YES;
-    self.handRayNode.hidden = YES;
+    self.barToastText = text;
+    self.barToastUntil = CACurrentMediaTime() + 2.2;
 }
 
-- (void)updateHandSkeletonWithHitDist:(float)hitDist hasHit:(BOOL)hasHit
+- (void)adjustLensSpacingBy:(float)delta
 {
-    if (!self.handTrackingEnabled || !self.handTracked)
+    self.lensSpacingRatio = std::max(0.28f, std::min(0.50f, self.lensSpacingRatio + delta));
+    [self saveVrBoxPreferences];
+    [self updateStereoOrFullLayout];
+    [self showBarToast:[NSString stringWithFormat:@"VR Box Goz Araligi: %.0f%%", self.lensSpacingRatio * 100.0f]];
+    [self redrawParsecBar];
+    if (!self.parsecConnected)
+        [self redrawParsecPanel];
+}
+
+- (void)adjustScreenScaleBy:(float)delta
+{
+    self.screenScale = std::max(0.60f, std::min(2.40f, self.screenScale + delta));
+    [self saveVrBoxPreferences];
+    [self applyScreenLayoutAndScale];
+    [self showBarToast:[NSString stringWithFormat:@"Ekran Boyutu: %.0f%%", self.screenScale * 100.0f]];
+    [self redrawParsecBar];
+}
+
+- (void)adjustScreenDistBy:(float)delta
+{
+    self.screenDistance = std::max(0.80f, std::min(2.60f, self.screenDistance + delta));
+    [self saveVrBoxPreferences];
+    [self applyScreenLayoutAndScale];
+    [self showBarToast:[NSString stringWithFormat:@"Ekran Mesafesi: %.2fm", self.screenDistance]];
+    [self redrawParsecBar];
+}
+
+- (void)toggleGamepadMode
+{
+    self.gamepadPassthroughMode = !self.gamepadPassthroughMode;
+    AudioServicesPlaySystemSound(1104);
+    if (!self.gamepadPassthroughMode)
     {
-        [self hideHandSkeleton];
+        if (self.parsecMouseHeld)
+        {
+            self.parsecMouseHeld = NO;
+            VRParsecSendMouseButton(self.heldMouseButton, 0);
+        }
+        VRParsecSendGamepadState(0, 0, 0, 0, 0, 0, 0);
+        VRParsecUnplugGamepad();
+        self.prevBtnA = YES;
+        self.prevBtnB = YES;
+        self.prevBtnX = YES;
+        self.prevBtnY = YES;
+        self.prevBtnLB = YES;
+        self.prevBtnRB = YES;
+        [self showBarToast:@"FARE MODU (L-Stick: Fare, MENU: Oyun Kolu)"];
+    }
+    else
+    {
+        self.suppressMenuUntilRelease = YES;
+        if (self.parsecMouseHeld)
+        {
+            self.parsecMouseHeld = NO;
+            VRParsecSendMouseButton(self.heldMouseButton, 0);
+        }
+        [self showBarToast:@"XBOX OYUN KOLU MODU (View+Menu: Fare Modu)"];
+    }
+    self.parsecCursorNode.hidden = !self.parsecConnected || self.gamepadPassthroughMode;
+    [self redrawParsecBar];
+}
+
+- (void)pollXboxControllerAtTime:(CFTimeInterval)now dt:(float)dt
+{
+    if (!self.activeController || !self.activeController.extendedGamepad)
+    {
+        [self refreshActiveController];
+        if (!self.activeController || !self.activeController.extendedGamepad)
+            return;
+    }
+
+    GCExtendedGamepad *gp = self.activeController.extendedGamepad;
+    BOOL btnA = gp.buttonA.pressed;
+    BOOL btnB = gp.buttonB.pressed;
+    BOOL btnX = gp.buttonX.pressed;
+    BOOL btnY = gp.buttonY.pressed;
+    BOOL btnLB = gp.leftShoulder.pressed;
+    BOOL btnRB = gp.rightShoulder.pressed;
+    BOOL btnMenu = gp.buttonMenu.pressed;
+    BOOL btnView = (gp.buttonOptions != nil && gp.buttonOptions.pressed);
+    BOOL btnHome = (gp.buttonHome != nil && gp.buttonHome.pressed);
+    BOOL btnL3 = (gp.leftThumbstickButton != nil && gp.leftThumbstickButton.pressed);
+    BOOL btnR3 = (gp.rightThumbstickButton != nil && gp.rightThumbstickButton.pressed);
+
+    BOOL dpU = gp.dpad.up.pressed;
+    BOOL dpD = gp.dpad.down.pressed;
+    BOOL dpL = gp.dpad.left.pressed;
+    BOOL dpR = gp.dpad.right.pressed;
+
+    float lx = gp.leftThumbstick.xAxis.value;
+    float ly = gp.leftThumbstick.yAxis.value;
+    float rx = gp.rightThumbstick.xAxis.value;
+    float ry = gp.rightThumbstick.yAxis.value;
+    float lt = gp.leftTrigger.value;
+    float rt = gp.rightTrigger.value;
+
+    // Connected + Xbox 360 Native Gamepad Mode
+    if (self.parsecConnected && self.gamepadPassthroughMode)
+    {
+        BOOL comboToggle = (btnView && btnMenu);
+        if (comboToggle && !self.prevComboToggle)
+        {
+            self.prevComboToggle = YES;
+            self.prevBtnMenu = YES;
+            [self toggleGamepadMode];
+            return;
+        }
+        self.prevComboToggle = comboToggle;
+
+        BOOL comboRecenter = (btnView && btnY);
+        if (comboRecenter && !self.prevComboRecenter)
+        {
+            self.prevComboRecenter = YES;
+            [self recenterWorkspace];
+            [self showBarToast:@"Ekran Ortalandi"];
+            return;
+        }
+        self.prevComboRecenter = comboRecenter;
+
+        if (btnView && (dpL || dpR || dpU || dpD))
+        {
+            if (now >= self.nextComboRepeatAt)
+            {
+                self.nextComboRepeatAt = now + 0.08;
+                if (dpL) [self adjustLensSpacingBy:-0.008f];
+                if (dpR) [self adjustLensSpacingBy:0.008f];
+                if (dpU) [self adjustScreenScaleBy:0.08f];
+                if (dpD) [self adjustScreenScaleBy:-0.08f];
+            }
+        }
+
+        if (!btnMenu)
+            self.suppressMenuUntilRelease = NO;
+
+        uint16_t mask = 0;
+        if (dpU) mask |= kParsecBtnDpadUp;
+        if (dpD) mask |= kParsecBtnDpadDown;
+        if (dpL) mask |= kParsecBtnDpadLeft;
+        if (dpR) mask |= kParsecBtnDpadRight;
+        if (btnMenu && !self.suppressMenuUntilRelease) mask |= kParsecBtnStart;
+        if (btnView && !btnMenu && !btnY && !dpL && !dpR && !dpU && !dpD) mask |= kParsecBtnBack;
+        if (btnL3) mask |= kParsecBtnLThumb;
+        if (btnR3) mask |= kParsecBtnRThumb;
+        if (btnLB) mask |= kParsecBtnLShoulder;
+        if (btnRB) mask |= kParsecBtnRShoulder;
+        if (btnHome) mask |= kParsecBtnGuide;
+        if (btnA) mask |= kParsecBtnA;
+        if (btnB) mask |= kParsecBtnB;
+        if (btnX) mask |= kParsecBtnX;
+        if (btnY && !btnView) mask |= kParsecBtnY;
+
+        int16_t sLX = FloatToThumbAxis(lx);
+        int16_t sLY = FloatToThumbAxis(ly);
+        int16_t sRX = FloatToThumbAxis(rx);
+        int16_t sRY = FloatToThumbAxis(ry);
+        uint8_t uLT = FloatToTriggerByte(lt);
+        uint8_t uRT = FloatToTriggerByte(rt);
+
+        BOOL changed = (mask != self.lastSentButtons ||
+                        abs(sLX - self.lastSentLX) > 64 || abs(sLY - self.lastSentLY) > 64 ||
+                        abs(sRX - self.lastSentRX) > 64 || abs(sRY - self.lastSentRY) > 64 ||
+                        abs((int)uLT - (int)self.lastSentLT) > 2 || abs((int)uRT - (int)self.lastSentRT) > 2);
+        if (changed || now >= self.nextGamepadHeartbeatAt)
+        {
+            self.lastSentButtons = mask;
+            self.lastSentLX = sLX;
+            self.lastSentLY = sLY;
+            self.lastSentRX = sRX;
+            self.lastSentRY = sRY;
+            self.lastSentLT = uLT;
+            self.lastSentRT = uRT;
+            self.nextGamepadHeartbeatAt = now + 0.08;
+            VRParsecSendGamepadState(mask, sLX, sLY, sRX, sRY, uLT, uRT);
+        }
+
+        self.prevBtnMenu = btnMenu;
         return;
     }
 
-    float alpha = 0.42f;
-    for (int i = 0; i < kHandJointCount; ++i)
+    // UI Panel Navigation (before Parsec is connected)
+    if (!self.parsecConnected)
     {
-        SCNVector3 cur = _currentHandJoints[i];
-        SCNVector3 tgt = _targetHandJoints[i];
-        SCNVector3 next = SCNVector3Make(cur.x + (tgt.x - cur.x) * alpha,
-                                         cur.y + (tgt.y - cur.y) * alpha,
-                                         cur.z + (tgt.z - cur.z) * alpha);
-        _currentHandJoints[i] = next;
-        _handJointNodes[i].position = next;
-        _handJointNodes[i].hidden = NO;
-    }
+        int navDir = 0;
+        if (dpU || ly > 0.55f) navDir = -1;
+        else if (dpD || ly < -0.55f) navDir = 1;
 
-    BOOL pinchActive = (self.pinchClosed || self.parsecMouseHeld);
-    self.indexTipMat.diffuse.contents = pinchActive
-        ? ColorHex(0x4ADE80, 0.98)
-        : ColorHex(0x5EEAD4, 0.96);
-    SCNVector3 tipScale = self.pinchClosed ? SCNVector3Make(1.32f, 1.32f, 1.32f) : SCNVector3Make(1.0f, 1.0f, 1.0f);
-    _handJointNodes[4].scale = tipScale;
-    _handJointNodes[8].scale = tipScale;
-
-    const simd_float3 up = simd_make_float3(0.0f, 1.0f, 0.0f);
-    for (int b = 0; b < kHandBoneCount; ++b)
-    {
-        SCNVector3 pA = _currentHandJoints[kHandBonePairs[b][0]];
-        SCNVector3 pB = _currentHandJoints[kHandBonePairs[b][1]];
-        float dx = pB.x - pA.x;
-        float dy = pB.y - pA.y;
-        float dz = pB.z - pA.z;
-        float len = sqrtf(dx * dx + dy * dy + dz * dz);
-        SCNNode *bone = _handBoneNodes[b];
-        if (len < 1e-4f)
+        if (navDir != 0)
         {
-            bone.hidden = YES;
-            continue;
-        }
-        bone.hidden = NO;
-        bone.position = SCNVector3Make((pA.x + pB.x) * 0.5f, (pA.y + pB.y) * 0.5f, (pA.z + pB.z) * 0.5f);
-        bone.scale = SCNVector3Make(1.0f, len, 1.0f);
-        simd_float3 dir = simd_make_float3(dx / len, dy / len, dz / len);
-        float d = simd_dot(up, dir);
-        if (d < -0.9995f)
-            bone.simdOrientation = simd_quaternion(static_cast<float>(M_PI), simd_make_float3(1.0f, 0.0f, 0.0f));
-        else
-            bone.simdOrientation = simd_quaternion(up, dir);
-    }
-
-    if (self.handAimEnabled && hasHit)
-    {
-        SCNVector3 tip = _currentHandJoints[8];
-        float rx = tip.x;
-        float ry = tip.y + 0.05f;
-        float rz = tip.z;
-        float rlen = sqrtf(rx * rx + ry * ry + rz * rz);
-        if (rlen > 1e-4f)
-        {
-            simd_float3 rdir = simd_make_float3(rx / rlen, ry / rlen, rz / rlen);
-            float rayLen = std::max(0.08f, std::min(2.5f, hitDist - rlen));
-            self.handRayNode.hidden = NO;
-            self.handRayNode.position = SCNVector3Make(tip.x + rdir.x * rayLen * 0.5f,
-                                                       tip.y + rdir.y * rayLen * 0.5f,
-                                                       tip.z + rdir.z * rayLen * 0.5f);
-            self.handRayNode.scale = SCNVector3Make(1.0f, rayLen, 1.0f);
-            float d = simd_dot(up, rdir);
-            if (d < -0.9995f)
-                self.handRayNode.simdOrientation = simd_quaternion(static_cast<float>(M_PI), simd_make_float3(1.0f, 0.0f, 0.0f));
-            else
-                self.handRayNode.simdOrientation = simd_quaternion(up, rdir);
+            if (now >= self.nextNavRepeatAt)
+            {
+                self.nextNavRepeatAt = now + 0.20;
+                NSUInteger count = _parsecPanelHits.size();
+                if (count > 0)
+                {
+                    NSInteger nextIdx = (self.selectedMenuIndex + navDir + static_cast<NSInteger>(count)) % static_cast<NSInteger>(count);
+                    self.selectedMenuIndex = nextIdx;
+                    AudioServicesPlaySystemSound(1104);
+                    [self redrawParsecPanel];
+                }
+            }
         }
         else
         {
-            self.handRayNode.hidden = YES;
+            self.nextNavRepeatAt = 0.0;
+        }
+
+        if ((dpL && !self.prevDpadL) || (dpR && !self.prevDpadR))
+            [self adjustLensSpacingBy:(dpR ? 0.008f : -0.008f)];
+        if (btnLB && !self.prevBtnLB)
+            [self adjustScreenScaleBy:-0.10f];
+        if (btnRB && !self.prevBtnRB)
+            [self adjustScreenScaleBy:0.10f];
+
+        if (btnA && !self.prevBtnA)
+        {
+            if (!_parsecPanelHits.empty())
+            {
+                NSInteger idx = std::max<NSInteger>(0, std::min<NSInteger>(self.selectedMenuIndex, static_cast<NSInteger>(_parsecPanelHits.size()) - 1));
+                NSString *bId = _parsecPanelHits[static_cast<size_t>(idx)].buttonId;
+                AudioServicesPlaySystemSound(1104);
+                [self handleButtonClick:bId];
+            }
+        }
+        if (btnX && !self.prevBtnX)
+        {
+            AudioServicesPlaySystemSound(1104);
+            if (self.showsHostList) [self refreshHosts];
+            else [self startParsecSignIn];
+        }
+        if (btnB && !self.prevBtnB && self.parsecConnecting)
+        {
+            AudioServicesPlaySystemSound(1104);
+            [self cancelConnect];
+        }
+        if (btnY && !self.prevBtnY)
+        {
+            AudioServicesPlaySystemSound(1104);
+            [self recenterWorkspace];
+            [self showBarToast:@"Ekran Ortalandi"];
         }
     }
     else
     {
-        self.handRayNode.hidden = YES;
+        // Connected + VR Mouse & Cinema Control Mode
+        if (btnMenu && !self.prevBtnMenu)
+        {
+            self.prevBtnMenu = YES;
+            [self toggleGamepadMode];
+            return;
+        }
+
+        // Left Stick moves PC mouse cursor across giant cinema screen with smooth precision curve
+        float mx = ApplyDeadzone(lx, 0.09f);
+        float my = ApplyDeadzone(ly, 0.09f);
+        if (mx != 0.0f || my != 0.0f)
+        {
+            float curveX = mx * (0.35f + 0.65f * fabsf(mx));
+            float curveY = my * (0.35f + 0.65f * fabsf(my));
+            float speed = 0.58f;
+            double nx = std::max(0.0, std::min(1.0, self.cursorUv.x + curveX * speed * dt));
+            double ny = std::max(0.0, std::min(1.0, self.cursorUv.y - curveY * speed * dt));
+            self.cursorUv = CGPointMake(nx, ny);
+            [self pushCursorUvToParsec];
+        }
+
+        // Right Stick Y scrolls mouse wheel on PC
+        float sy = ApplyDeadzone(ry, 0.14f);
+        if (sy != 0.0f && now >= self.nextNavRepeatAt)
+        {
+            self.nextNavRepeatAt = now + 0.035;
+            VRParsecSendMouseWheel(0, static_cast<int>(sy * 110.0f));
+        }
+
+        // A Button: Left Mouse Hold & Drag
+        if (btnA && !self.prevBtnA)
+        {
+            AudioServicesPlaySystemSound(1104);
+            self.heldMouseButton = 1;
+            self.parsecMouseHeld = YES;
+            VRParsecSendMouseButton(1, 1);
+        }
+        else if (!btnA && self.prevBtnA && self.parsecMouseHeld)
+        {
+            self.parsecMouseHeld = NO;
+            VRParsecSendMouseButton(self.heldMouseButton, 0);
+        }
+
+        // B Button: Right Mouse Click
+        if (btnB && !self.prevBtnB)
+        {
+            AudioServicesPlaySystemSound(1104);
+            VRParsecSendMouseButton(3, 1);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.04 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                VRParsecSendMouseButton(3, 0);
+            });
+        }
+
+        // X Button: Quick Double Left Click (opens desktop shortcuts easily)
+        if (btnX && !self.prevBtnX)
+        {
+            AudioServicesPlaySystemSound(1104);
+            VRParsecSendMouseButton(1, 1);
+            VRParsecSendMouseButton(1, 0);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.07 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                VRParsecSendMouseButton(1, 1);
+                VRParsecSendMouseButton(1, 0);
+            });
+        }
+
+        // Y Button: Recenter cinema screen
+        if (btnY && !self.prevBtnY)
+        {
+            AudioServicesPlaySystemSound(1104);
+            [self recenterWorkspace];
+            [self showBarToast:@"Ekran Ortalandi"];
+            [self redrawParsecBar];
+        }
+
+        // D-Pad L/R: Live VR Box IPD lens convergence
+        if (dpL || dpR || dpU || dpD)
+        {
+            if (now >= self.nextComboRepeatAt)
+            {
+                self.nextComboRepeatAt = now + 0.09;
+                if (dpL) [self adjustLensSpacingBy:-0.008f];
+                if (dpR) [self adjustLensSpacingBy:0.008f];
+                if (dpU) [self adjustScreenScaleBy:0.08f];
+                if (dpD) [self adjustScreenScaleBy:-0.08f];
+            }
+        }
+
+        // LB / RB: Distance closer / further
+        if (btnLB && !self.prevBtnLB)
+            [self adjustScreenDistBy:0.12f];
+        if (btnRB && !self.prevBtnRB)
+            [self adjustScreenDistBy:-0.12f];
+
+        // View button alone in Mouse Mode toggles Head-Lock vs World 6DoF Lock
+        if (btnView && !self.prevComboToggle && now >= self.nextNavRepeatAt)
+        {
+            self.nextNavRepeatAt = now + 0.30;
+            self.headLockMode = !self.headLockMode;
+            AudioServicesPlaySystemSound(1104);
+            [self showBarToast:(self.headLockMode ? @"Kafa Takip Modu: ACIK" : @"Odaya Sabit 6DoF Modu")];
+            [self redrawParsecBar];
+        }
     }
+
+    self.prevBtnA = btnA;
+    self.prevBtnB = btnB;
+    self.prevBtnX = btnX;
+    self.prevBtnY = btnY;
+    self.prevBtnLB = btnLB;
+    self.prevBtnRB = btnRB;
+    self.prevBtnMenu = btnMenu;
+    self.prevDpadL = dpL;
+    self.prevDpadR = dpR;
+    self.prevDpadU = dpU;
+    self.prevDpadD = dpD;
 }
 
-- (SCNNode *)anchorNodeForGrabIndex:(int)idx
+- (void)pushCursorUvToParsec
 {
-    if (idx == -1) return self.mainAnchorNode;
-    if (idx >= 0 && idx < kMaxWebMonitors) return _sideSlots[idx].anchorNode;
-    if (idx == 10) return self.keyboardNode;
-    if (idx == 11) return self.dockNode;
-    return nil;
+    int maxW = std::max(1, self.hostWidth - 1);
+    int maxH = std::max(1, self.hostHeight - 1);
+    int px = static_cast<int>(self.cursorUv.x * maxW);
+    int py = static_cast<int>(self.cursorUv.y * maxH);
+    if (px != self.lastMousePx || py != self.lastMousePy)
+    {
+        self.lastMousePx = px;
+        self.lastMousePy = py;
+        VRParsecSendStreamMousePosition(0, px, py);
+    }
+
+    SCNPlane *pl = (SCNPlane *)self.parsecScreenNode.geometry;
+    self.parsecCursorNode.hidden = !self.parsecConnected || self.gamepadPassthroughMode;
+    self.parsecCursorNode.position = SCNVector3Make((self.cursorUv.x - 0.5) * pl.width,
+                                                    (0.5 - self.cursorUv.y) * pl.height,
+                                                    0.015f);
 }
 
-- (void)startGrabForIndex:(int)idx
-{
-    if (self.movingMonitorIndex == idx)
-    {
-        [self finishGrabAtCurrentPose];
-        return;
-    }
-
-    SCNNode *anchor = [self anchorNodeForGrabIndex:idx];
-    if (!anchor)
-        return;
-
-    CFTimeInterval now = CACurrentMediaTime();
-    SCNVector3 rayOrigin = SCNVector3Zero, rayDir = SCNVector3Make(0, 0, -1);
-    [self computeActiveRayOrigin:&rayOrigin dir:&rayDir];
-    SCNVector3 aw = [anchor convertPosition:SCNVector3Zero toNode:self.scene.rootNode];
-    float dist = sqrtf((aw.x - rayOrigin.x) * (aw.x - rayOrigin.x) +
-                       (aw.y - rayOrigin.y) * (aw.y - rayOrigin.y) +
-                       (aw.z - rayOrigin.z) * (aw.z - rayOrigin.z));
-
-    self.movingMonitorIndex = idx;
-    self.grabBaseDistance = std::max(0.50f, std::min(2.40f, dist));
-    self.grabInitialHandDepth = _targetHandDepth > 0.05f ? _targetHandDepth : 0.44f;
-    self.grabStartedAt = now;
-    self.grabSteadyPos = anchor.position;
-    self.grabSteadySince = now;
-    self.grabHasMovedSignificantly = NO;
-
-    AudioServicesPlaySystemSound(1104);
-    [self redrawGrabBars];
-    [self redrawDockPanel];
-    [self redrawPalmMenuPanel];
-    if (idx >= 0 && idx < kMaxWebMonitors)
-        [self redrawSideBar:idx];
-}
-
-- (void)finishGrabAtCurrentPose
-{
-    int prevIdx = self.movingMonitorIndex;
-    self.movingMonitorIndex = -2;
-    self.grabHasMovedSignificantly = NO;
-    AudioServicesPlaySystemSound(1104);
-    [self redrawGrabBars];
-    [self redrawDockPanel];
-    [self redrawPalmMenuPanel];
-    if (prevIdx >= 0 && prevIdx < kMaxWebMonitors)
-        [self redrawSideBar:prevIdx];
-}
-
-- (void)updateLiveGrabbedTargetAtTime:(CFTimeInterval)now
-{
-    int idx = self.movingMonitorIndex;
-    SCNNode *anchor = [self anchorNodeForGrabIndex:idx];
-    if (!anchor)
-    {
-        self.movingMonitorIndex = -2;
-        return;
-    }
-
-    SCNVector3 origin = SCNVector3Zero, dir = SCNVector3Make(0, 0, -1);
-    [self computeActiveRayOrigin:&origin dir:&dir];
-    float depthDelta = self.handTracked ? (self.grabInitialHandDepth - _targetHandDepth) : 0.0f;
-    float targetDist = std::max(0.45f, std::min(2.60f, self.grabBaseDistance + depthDelta * 2.2f));
-
-    SCNVector3 worldTarget = SCNVector3Make(origin.x + dir.x * targetDist,
-                                            origin.y + dir.y * targetDist,
-                                            origin.z + dir.z * targetDist);
-    SCNVector3 localTarget = [self.workspaceRoot convertPosition:worldTarget fromNode:self.scene.rootNode];
-    SCNVector3 curPos = anchor.position;
-    SCNVector3 nextPos = SCNVector3Make(curPos.x + (localTarget.x - curPos.x) * 0.28f,
-                                        curPos.y + (localTarget.y - curPos.y) * 0.28f,
-                                        curPos.z + (localTarget.z - curPos.z) * 0.28f);
-    anchor.position = nextPos;
-
-    SCNVector3 headLocal = [self.workspaceRoot convertPosition:[self.headNode convertPosition:SCNVector3Zero toNode:self.scene.rootNode]
-                                                      fromNode:self.scene.rootNode];
-    float dx = headLocal.x - nextPos.x;
-    float dy = headLocal.y - nextPos.y;
-    float dz = headLocal.z - nextPos.z;
-    float yaw = atan2f(dx, dz);
-    float horiz = sqrtf(dx * dx + dz * dz);
-    float pitch = -atan2f(dy, MAX(0.1f, horiz));
-    if (idx == 10)
-        pitch = std::max(-0.90f, std::min(0.20f, pitch - 0.36f));
-    else if (idx == 11)
-        pitch = std::max(-0.95f, std::min(0.20f, pitch - 0.44f));
-    anchor.eulerAngles = SCNVector3Make(pitch, yaw, 0);
-
-    float moveDelta = sqrtf((nextPos.x - self.grabSteadyPos.x) * (nextPos.x - self.grabSteadyPos.x) +
-                            (nextPos.y - self.grabSteadyPos.y) * (nextPos.y - self.grabSteadyPos.y) +
-                            (nextPos.z - self.grabSteadyPos.z) * (nextPos.z - self.grabSteadyPos.z));
-    if (moveDelta > 0.025f)
-    {
-        self.grabSteadyPos = nextPos;
-        self.grabSteadySince = now;
-        self.grabHasMovedSignificantly = YES;
-    }
-    else if (self.grabHasMovedSignificantly && (now - self.grabStartedAt) >= 1.1 && (now - self.grabSteadySince) >= 0.70)
-    {
-        [self finishGrabAtCurrentPose];
-    }
-}
-
-- (void)updatePalmMenuAtTime:(CFTimeInterval)now
-{
-    BOOL show = self.handTrackingEnabled && (now < self.palmMenuVisibleUntil);
-    if (!show)
-    {
-        self.palmMenuNode.hidden = YES;
-        return;
-    }
-
-    if (self.palmMenuNode.hidden)
-    {
-        self.palmMenuNode.hidden = NO;
-        [self redrawPalmMenuPanel];
-    }
-
-    if (self.handTracked)
-    {
-        SCNVector3 palm = _currentHandJoints[9];
-        float offX = (palm.x < 0.0f) ? 0.22f : -0.22f;
-        float tx = std::max(-0.22f, std::min(0.22f, palm.x + offX));
-        float ty = std::max(-0.14f, std::min(0.16f, palm.y + 0.08f));
-        float tz = std::max(-0.48f, std::min(-0.34f, palm.z));
-        SCNVector3 cur = self.palmMenuNode.position;
-        if (hypot(cur.x, cur.y) < 0.001f && cur.z == 0.0f)
-            self.palmMenuNode.position = SCNVector3Make(tx, ty, tz);
-        else
-            self.palmMenuNode.position = SCNVector3Make(cur.x + (tx - cur.x) * 0.25f,
-                                                        cur.y + (ty - cur.y) * 0.25f,
-                                                        cur.z + (tz - cur.z) * 0.25f);
-    }
-}
+#pragma mark - 120 Hz Frame Tick
 
 - (void)onTick:(CADisplayLink *)link
 {
     (void)link;
     CFTimeInterval now = CACurrentMediaTime();
+    float dt = static_cast<float>(std::max(0.001, std::min(0.05, now - self.lastTickAt)));
+    self.lastTickAt = now;
 
-    [self updatePalmMenuAtTime:now];
-    if (self.movingMonitorIndex != -2)
-        [self updateLiveGrabbedTargetAtTime:now];
-    [self updatePointerHoverAndCursor];
-    [self updateParsecStream];
-    [self updateSideStreams:now];
-
-    if (self.flashedButtonId != nil && now >= self.flashUntil)
+    if (self.headLockMode && self.parsecConnected)
     {
-        self.flashedButtonId = nil;
-        [self redrawKeyboardPanel];
-        [self redrawDockPanel];
-        if (!self.palmMenuNode.hidden)
-            [self redrawPalmMenuPanel];
+        SCNMatrix4 m = self.headNode.worldTransform;
+        SCNVector3 headPos = SCNVector3Make(m.m41, m.m42, m.m43);
+        SCNVector3 curPos = self.cinemaRootNode.position;
+        self.cinemaRootNode.position = SCNVector3Make(curPos.x + (headPos.x - curPos.x) * 0.14f,
+                                                      curPos.y + (headPos.y - curPos.y) * 0.14f,
+                                                      curPos.z + (headPos.z - curPos.z) * 0.14f);
+        float fx = -m.m31;
+        float fz = -m.m33;
+        float targetYaw = atan2f(-fx, -fz);
+        float curYaw = self.cinemaRootNode.eulerAngles.y;
+        float diff = targetYaw - curYaw;
+        while (diff > M_PI) diff -= 2.0f * static_cast<float>(M_PI);
+        while (diff < -M_PI) diff += 2.0f * static_cast<float>(M_PI);
+        self.cinemaRootNode.eulerAngles = SCNVector3Make(0, curYaw + diff * 0.12f, 0);
     }
 
-    UIColor *reticleColor = (self.pinchClosed || self.movingMonitorIndex != -2)
-        ? ColorHex(0x4ADE80)
-        : (self.handTracked ? ColorHex(0x5EEAD4) : [UIColor whiteColor]);
-    self.leftReticle.layer.borderColor = reticleColor.CGColor;
-    self.rightReticle.layer.borderColor = reticleColor.CGColor;
-    CGFloat scale = (self.hoveredButtonId != nil || self.movingMonitorIndex != -2) ? 1.45 : 1.0;
-    self.leftReticle.transform = CGAffineTransformMakeScale(scale, scale);
-    self.rightReticle.transform = CGAffineTransformMakeScale(scale, scale);
+    [self pollXboxControllerAtTime:now dt:dt];
+    [self updateParsecStream];
+
+    if (self.barToastText != nil && now >= self.barToastUntil)
+    {
+        self.barToastText = nil;
+        [self redrawParsecBar];
+    }
+
+    if (self.parsecConnected && now >= self.nextBarRedrawAt)
+    {
+        self.nextBarRedrawAt = now + 2.0;
+        [self redrawParsecBar];
+    }
 }
+
+#pragma mark - Fallback Gaze & Screen Touch Interaction
 
 - (BOOL)isCandidateVisible:(SCNNode *)node
 {
@@ -1331,16 +1162,11 @@ namespace
     float hx = lo.x + t * ld.x;
     float hy = lo.y + t * ld.y;
     SCNPlane *pl = (SCNPlane *)node.geometry;
-    float halfW = static_cast<float>(pl.width * 0.5);
-    float halfH = static_cast<float>(pl.height * 0.5);
-    if (fabsf(hx) > halfW || fabsf(hy) > halfH)
+    if (fabsf(hx) > static_cast<float>(pl.width * 0.5) || fabsf(hy) > static_cast<float>(pl.height * 0.5))
         return;
 
     simd_float4 hw = simd_mul(wt, simd_make_float4(hx, hy, 0.0f, 1.0f));
-    float dx = hw.x - origin.x;
-    float dy = hw.y - origin.y;
-    float dz = hw.z - origin.z;
-    float dist = sqrtf(dx * dx + dy * dy + dz * dz);
+    float dist = simd_length(hw.xyz - origin);
     if (dist < best.dist)
     {
         float u = std::max(0.0f, std::min(1.0f, hx / std::max(1e-4f, static_cast<float>(pl.width)) + 0.5f));
@@ -1348,32 +1174,27 @@ namespace
         best.node = node;
         best.uv = CGPointMake(u, v);
         best.dist = dist;
-        best.worldPoint = SCNVector3Make(hw.x, hw.y, hw.z);
     }
 }
 
-- (VRRayHit)analyticRaycastOrigin:(SCNVector3)origin dir:(SCNVector3)dir
+- (VRRayHit)raycastOrigin:(SCNVector3)origin dir:(SCNVector3)dir
 {
     VRRayHit best;
     simd_float3 o = simd_make_float3(origin.x, origin.y, origin.z);
     simd_float3 d = simd_make_float3(dir.x, dir.y, dir.z);
-
-    [self testPlaneNode:self.palmMenuNode rayOrigin:o rayDir:d bestHit:best];
-    [self testPlaneNode:self.keyboardGrabNode rayOrigin:o rayDir:d bestHit:best];
-    [self testPlaneNode:self.keyboardNode rayOrigin:o rayDir:d bestHit:best];
-    [self testPlaneNode:self.dockGrabNode rayOrigin:o rayDir:d bestHit:best];
-    [self testPlaneNode:self.dockNode rayOrigin:o rayDir:d bestHit:best];
-    [self testPlaneNode:self.mainGrabNode rayOrigin:o rayDir:d bestHit:best];
     [self testPlaneNode:self.parsecBarNode rayOrigin:o rayDir:d bestHit:best];
     [self testPlaneNode:self.parsecPanelNode rayOrigin:o rayDir:d bestHit:best];
     [self testPlaneNode:self.parsecScreenNode rayOrigin:o rayDir:d bestHit:best];
-    for (int i = 0; i < kMaxWebMonitors; ++i)
-    {
-        [self testPlaneNode:_sideSlots[i].grabNode rayOrigin:o rayDir:d bestHit:best];
-        [self testPlaneNode:_sideSlots[i].barNode rayOrigin:o rayDir:d bestHit:best];
-        [self testPlaneNode:_sideSlots[i].screenNode rayOrigin:o rayDir:d bestHit:best];
-    }
     return best;
+}
+
+- (VRRayHit)raycastCenterGaze
+{
+    simd_float4x4 hm = self.headNode.simdWorldTransform;
+    simd_float4 wo = simd_mul(hm, simd_make_float4(0, 0, 0, 1));
+    simd_float4 wd = simd_mul(hm, simd_make_float4(0, 0, -1, 0));
+    simd_float3 d = simd_normalize(wd.xyz);
+    return [self raycastOrigin:SCNVector3Make(wo.x, wo.y, wo.z) dir:SCNVector3Make(d.x, d.y, d.z)];
 }
 
 - (VRRayHit)raycastTouchPoint:(CGPoint)ptInView
@@ -1390,245 +1211,17 @@ namespace
     float len = sqrtf(dx * dx + dy * dy + dz * dz);
     if (len < 1e-5f)
         return VRRayHit{};
-    SCNVector3 dir = SCNVector3Make(dx / len, dy / len, dz / len);
-    return [self analyticRaycastOrigin:pNear dir:dir];
-}
-
-- (void)computeActiveRayOrigin:(SCNVector3 *)outOrigin dir:(SCNVector3 *)outDir
-{
-    simd_float4x4 hm = self.headNode.simdWorldTransform;
-    SCNVector3 localOrigin = SCNVector3Zero;
-    SCNVector3 localDir = SCNVector3Make(0, 0, -1.0f);
-    if (self.handAimEnabled && self.handTracked)
-    {
-        SCNVector3 tip = _currentHandJoints[8];
-        localOrigin = SCNVector3Make(0.0f, -0.05f, 0.0f);
-        float dx = tip.x - localOrigin.x;
-        float dy = tip.y - localOrigin.y;
-        float dz = tip.z - localOrigin.z;
-        float len = sqrtf(dx * dx + dy * dy + dz * dz);
-        if (len > 1e-4f)
-            localDir = SCNVector3Make(dx / len, dy / len, dz / len);
-    }
-
-    simd_float4 wo = simd_mul(hm, simd_make_float4(localOrigin.x, localOrigin.y, localOrigin.z, 1.0f));
-    simd_float4 wd = simd_mul(hm, simd_make_float4(localDir.x, localDir.y, localDir.z, 0.0f));
-    float wlen = sqrtf(wd.x * wd.x + wd.y * wd.y + wd.z * wd.z);
-    if (wlen > 1e-5f)
-    {
-        wd.x /= wlen;
-        wd.y /= wlen;
-        wd.z /= wlen;
-    }
-
-    SCNVector3 origin = SCNVector3Make(wo.x, wo.y, wo.z);
-    SCNVector3 dir = SCNVector3Make(wd.x, wd.y, wd.z);
-    if (outOrigin) *outOrigin = origin;
-    if (outDir) *outDir = dir;
-}
-
-- (VRRayHit)raycastCenterGaze:(SCNVector3 *)outOrigin dir:(SCNVector3 *)outDir
-{
-    SCNVector3 origin = SCNVector3Zero, dir = SCNVector3Make(0, 0, -1);
-    [self computeActiveRayOrigin:&origin dir:&dir];
-    if (outOrigin) *outOrigin = origin;
-    if (outDir) *outDir = dir;
-    return [self analyticRaycastOrigin:origin dir:dir];
-}
-
-- (const VRButtonHit *)buttonHitAtUv:(CGPoint)uv inList:(const std::vector<VRButtonHit> &)list
-{
-    for (const auto &b : list)
-    {
-        if (!b.disabled && CGRectContainsPoint(b.uvRect, uv))
-            return &b;
-    }
-    return nullptr;
+    return [self raycastOrigin:pNear dir:SCNVector3Make(dx / len, dy / len, dz / len)];
 }
 
 - (NSString *)buttonAtUv:(CGPoint)uv inList:(const std::vector<VRButtonHit> &)list
 {
-    const VRButtonHit *b = [self buttonHitAtUv:uv inList:list];
-    return b ? b->buttonId : nil;
-}
-
-- (int)sideSlotIndexForNode:(SCNNode *)node isBar:(BOOL *)outIsBar
-{
-    for (int i = 0; i < kMaxWebMonitors; ++i)
+    for (const auto &b : list)
     {
-        if (node == _sideSlots[i].screenNode) { if (outIsBar) *outIsBar = NO; return i; }
-        if (node == _sideSlots[i].barNode) { if (outIsBar) *outIsBar = YES; return i; }
+        if (!b.disabled && CGRectContainsPoint(b.uvRect, uv))
+            return b.buttonId;
     }
-    return -1;
-}
-
-- (void)applyHoverOverlayToNode:(SCNNode *)panelNode buttonHit:(const VRButtonHit *)btnHit
-{
-    if (!panelNode || !btnHit)
-    {
-        self.hoverHighlightNode.hidden = YES;
-        return;
-    }
-    SCNPlane *pl = (SCNPlane *)panelNode.geometry;
-    CGRect uvr = btnHit->uvRect;
-    float uCenter = static_cast<float>(uvr.origin.x + uvr.size.width * 0.5);
-    float vCenter = static_cast<float>(uvr.origin.y + uvr.size.height * 0.5);
-    float bw = static_cast<float>(uvr.size.width * pl.width);
-    float bh = static_cast<float>(uvr.size.height * pl.height);
-    if (self.hoverHighlightNode.parentNode != panelNode)
-        [panelNode addChildNode:self.hoverHighlightNode];
-    self.hoverHighlightNode.position = SCNVector3Make((uCenter - 0.5f) * static_cast<float>(pl.width),
-                                                      (0.5f - vCenter) * static_cast<float>(pl.height),
-                                                      0.004f);
-    self.hoverHighlightNode.scale = SCNVector3Make(bw, bh, 1.0f);
-    self.hoverHighlightNode.hidden = NO;
-}
-
-- (int)grabTargetIndexForGrabNode:(SCNNode *)node
-{
-    if (!node) return -2;
-    if (node == self.mainGrabNode) return -1;
-    if (node == self.keyboardGrabNode) return 10;
-    if (node == self.dockGrabNode) return 11;
-    for (int i = 0; i < kMaxWebMonitors; ++i)
-    {
-        if (node == _sideSlots[i].grabNode)
-            return i;
-    }
-    return -2;
-}
-
-- (void)updatePointerHoverAndCursor
-{
-    VRRayHit hit = [self raycastCenterGaze:nil dir:nil];
-    [self updateHandSkeletonWithHitDist:hit.dist hasHit:(hit.node != nil)];
-
-    if (self.fingerPokePending)
-    {
-        self.fingerPokePending = NO;
-        [self handleRayHitDown:hit fromDirectTouch:NO];
-    }
-
-    if (self.parsecMouseHeld)
-    {
-        if (hit.node == self.parsecScreenNode && self.parsecConnected)
-        {
-            int maxW = std::max(1, self.hostWidth - 1);
-            int maxH = std::max(1, self.hostHeight - 1);
-            int px = static_cast<int>(hit.uv.x * maxW);
-            int py = static_cast<int>(hit.uv.y * maxH);
-            if (px != self.lastMousePx || py != self.lastMousePy)
-            {
-                self.lastMousePx = px;
-                self.lastMousePy = py;
-                VRParsecSendStreamMousePosition(0, px, py);
-            }
-            self.parsecCursorNode.hidden = NO;
-            SCNPlane *pl = (SCNPlane *)self.parsecScreenNode.geometry;
-            self.parsecCursorNode.position = SCNVector3Make((hit.uv.x - 0.5) * pl.width, (0.5 - hit.uv.y) * pl.height, 0.01f);
-        }
-        return;
-    }
-
-    NSString *newNode = hit.node ? hit.node.name : nil;
-    NSString *newBtn = nil;
-    const VRButtonHit *btnHit = nullptr;
-    VRButtonHit fullGrabHit{CGRectMake(0, 0, 1, 1), nil, nil, NO, NO};
-
-    self.parsecCursorNode.hidden = YES;
-    for (int i = 0; i < kMaxWebMonitors; ++i)
-        _sideSlots[i].cursorNode.hidden = YES;
-
-    CFTimeInterval now = CACurrentMediaTime();
-
-    if (hit.node)
-    {
-        CGPoint uv = hit.uv;
-        BOOL isSideBar = NO;
-        int sideIdx = [self sideSlotIndexForNode:hit.node isBar:&isSideBar];
-        int grabIdx = [self grabTargetIndexForGrabNode:hit.node];
-        int maxW = std::max(1, self.hostWidth - 1);
-        int maxH = std::max(1, self.hostHeight - 1);
-
-        if (hit.node == self.parsecScreenNode || hit.node == self.parsecPanelNode || hit.node == self.parsecBarNode || hit.node == self.mainGrabNode)
-            self.lastFocusedTargetIndex = -1;
-        else if (sideIdx >= 0)
-            self.lastFocusedTargetIndex = sideIdx;
-        else if (grabIdx != -2)
-            self.lastFocusedTargetIndex = grabIdx;
-        else if (hit.node == self.keyboardNode)
-            self.lastFocusedTargetIndex = 10;
-        else if (hit.node == self.dockNode)
-            self.lastFocusedTargetIndex = 11;
-
-        if (grabIdx != -2 && self.movingMonitorIndex == -2)
-        {
-            fullGrabHit.buttonId = [NSString stringWithFormat:@"__grab_%d", grabIdx];
-            btnHit = &fullGrabHit;
-        }
-        else if (hit.node == self.palmMenuNode)
-        {
-            self.palmMenuVisibleUntil = now + 4.5;
-            btnHit = [self buttonHitAtUv:uv inList:_palmMenuHits];
-        }
-        else if (hit.node == self.parsecScreenNode && self.parsecConnected)
-        {
-            self.parsecCursorNode.hidden = NO;
-            SCNPlane *pl = (SCNPlane *)self.parsecScreenNode.geometry;
-            self.parsecCursorNode.position = SCNVector3Make((uv.x - 0.5) * pl.width, (0.5 - uv.y) * pl.height, 0.01f);
-            int px = static_cast<int>(uv.x * maxW);
-            int py = static_cast<int>(uv.y * maxH);
-            if (!self.singleScreenTouchMode && (px != self.lastMousePx || py != self.lastMousePy))
-            {
-                self.lastMousePx = px;
-                self.lastMousePy = py;
-                VRParsecSendStreamMousePosition(0, px, py);
-            }
-        }
-        else if (sideIdx >= 0 && !isSideBar)
-        {
-            SideMonitorSlot &slot = _sideSlots[sideIdx];
-            slot.cursorNode.hidden = NO;
-            SCNPlane *pl = (SCNPlane *)slot.screenNode.geometry;
-            slot.cursorNode.position = SCNVector3Make((uv.x - 0.5) * pl.width, (0.5 - uv.y) * pl.height, 0.01f);
-            int px = static_cast<int>(uv.x * maxW);
-            int py = static_cast<int>(uv.y * maxH);
-            if (slot.useParsecStream2 && self.parsecConnected && !self.singleScreenTouchMode)
-                VRParsecSendStreamMousePosition(1, px, py);
-        }
-        else if (sideIdx >= 0 && isSideBar)
-            btnHit = [self buttonHitAtUv:uv inList:_sideSlots[sideIdx].barHits];
-        else if (hit.node == self.parsecPanelNode)
-            btnHit = [self buttonHitAtUv:uv inList:_parsecPanelHits];
-        else if (hit.node == self.parsecBarNode)
-            btnHit = [self buttonHitAtUv:uv inList:_parsecBarHits];
-        else if (hit.node == self.dockNode)
-            btnHit = [self buttonHitAtUv:uv inList:_dockHits];
-        else if (hit.node == self.keyboardNode)
-            btnHit = [self buttonHitAtUv:uv inList:_keyboardHits];
-
-        if (btnHit)
-            newBtn = btnHit->buttonId;
-    }
-
-    self.hoveredNodeKey = newNode;
-    self.hoveredButtonId = newBtn;
-    [self applyHoverOverlayToNode:hit.node buttonHit:btnHit];
-}
-
-- (CGPoint)averageTouchPointInSet:(NSSet<UITouch *> *)touches
-{
-    CGFloat sx = 0.0, sy = 0.0;
-    NSUInteger count = touches.count;
-    for (UITouch *t in touches)
-    {
-        CGPoint p = [t locationInView:self.view];
-        sx += p.x;
-        sy += p.y;
-    }
-    if (count == 0)
-        return CGPointZero;
-    return CGPointMake(sx / count, sy / count);
+    return nil;
 }
 
 - (void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
@@ -1636,21 +1229,39 @@ namespace
     NSSet<UITouch *> *all = event.allTouches;
     if (all.count >= 2)
     {
-        CGPoint avg = [self averageTouchPointInSet:all];
+        CGFloat sy = 0.0;
+        for (UITouch *t in all) sy += [t locationInView:self.view].y;
         self.isTwoFingerScrolling = YES;
-        self.twoFingerScrollLastY = avg.y;
-        [self handlePrimaryActionUp];
+        self.twoFingerScrollLastY = sy / all.count;
         return;
     }
 
     UITouch *touch = [touches anyObject];
-    if (!touch)
-        return;
+    if (!touch) return;
     CGPoint pt = [touch locationInView:self.view];
     VRRayHit hit = [self raycastTouchPoint:pt];
     if (!hit.node && !self.singleScreenTouchMode)
-        hit = [self raycastCenterGaze:nil dir:nil];
-    [self handleRayHitDown:hit fromDirectTouch:YES];
+        hit = [self raycastCenterGaze];
+    if (!hit.node) return;
+
+    if (hit.node == self.parsecScreenNode && self.parsecConnected)
+    {
+        self.cursorUv = hit.uv;
+        [self pushCursorUvToParsec];
+        self.heldMouseButton = 1;
+        self.parsecMouseHeld = YES;
+        VRParsecSendMouseButton(1, 1);
+        return;
+    }
+
+    NSString *btnId = nil;
+    if (hit.node == self.parsecPanelNode) btnId = [self buttonAtUv:hit.uv inList:_parsecPanelHits];
+    else if (hit.node == self.parsecBarNode) btnId = [self buttonAtUv:hit.uv inList:_parsecBarHits];
+    if (btnId)
+    {
+        AudioServicesPlaySystemSound(1104);
+        [self handleButtonClick:btnId];
+    }
 }
 
 - (void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event
@@ -1658,64 +1269,25 @@ namespace
     NSSet<UITouch *> *all = event.allTouches;
     if (self.isTwoFingerScrolling && all.count >= 2)
     {
-        CGPoint avg = [self averageTouchPointInSet:all];
-        CGFloat dy = avg.y - self.twoFingerScrollLastY;
-        if (fabs(dy) >= 2.0)
+        CGFloat sy = 0.0;
+        for (UITouch *t in all) sy += [t locationInView:self.view].y;
+        CGFloat avgY = sy / all.count;
+        CGFloat dy = avgY - self.twoFingerScrollLastY;
+        if (fabs(dy) >= 2.0 && self.parsecConnected)
         {
-            self.twoFingerScrollLastY = avg.y;
-            VRRayHit hit = [self raycastTouchPoint:avg];
-            BOOL isSideBar = NO;
-            int sideIdx = hit.node ? [self sideSlotIndexForNode:hit.node isBar:&isSideBar] : -1;
-            if (self.parsecConnected && (hit.node == self.parsecScreenNode || self.inputTarget == InputTarget::ParsecHost || (sideIdx >= 0 && _sideSlots[sideIdx].useParsecStream2)))
-                VRParsecSendMouseWheel(0, static_cast<int>(dy * 5.0));
-            else if (sideIdx >= 0 && !isSideBar)
-                VRWebScrollSlot(sideIdx, 0.5f, 0.5f, static_cast<float>(-dy * 4.0));
+            self.twoFingerScrollLastY = avgY;
+            VRParsecSendMouseWheel(0, static_cast<int>(dy * 5.0));
         }
         return;
     }
 
     UITouch *touch = [touches anyObject];
-    if (!touch)
-        return;
-    CGPoint pt = [touch locationInView:self.view];
-    VRRayHit hit = [self raycastTouchPoint:pt];
-    if (!hit.node)
-        return;
-
-    CGPoint uv = hit.uv;
-    BOOL isSideBar = NO;
-    int sideIdx = [self sideSlotIndexForNode:hit.node isBar:&isSideBar];
-    int maxW = std::max(1, self.hostWidth - 1);
-    int maxH = std::max(1, self.hostHeight - 1);
-
-    if (self.parsecMouseHeld)
+    if (!touch || !self.parsecMouseHeld || !self.parsecConnected) return;
+    VRRayHit hit = [self raycastTouchPoint:[touch locationInView:self.view]];
+    if (hit.node == self.parsecScreenNode)
     {
-        if (hit.node == self.parsecScreenNode && self.parsecConnected)
-        {
-            int px = static_cast<int>(uv.x * maxW);
-            int py = static_cast<int>(uv.y * maxH);
-            self.lastMousePx = px;
-            self.lastMousePy = py;
-            VRParsecSendStreamMousePosition(0, px, py);
-            self.parsecCursorNode.hidden = NO;
-            SCNPlane *pl = (SCNPlane *)self.parsecScreenNode.geometry;
-            self.parsecCursorNode.position = SCNVector3Make((uv.x - 0.5) * pl.width, (0.5 - uv.y) * pl.height, 0.01f);
-        }
-        else if (sideIdx >= 0 && !isSideBar && _sideSlots[sideIdx].useParsecStream2 && self.parsecConnected)
-        {
-            int px = static_cast<int>(uv.x * maxW);
-            int py = static_cast<int>(uv.y * maxH);
-            VRParsecSendStreamMousePosition(1, px, py);
-        }
-        return;
-    }
-
-    if (hit.node == self.keyboardNode)
-    {
-        const VRButtonHit *btn = [self buttonHitAtUv:uv inList:_keyboardHits];
-        self.hoveredNodeKey = hit.node.name;
-        self.hoveredButtonId = btn ? btn->buttonId : nil;
-        [self applyHoverOverlayToNode:hit.node buttonHit:btn];
+        self.cursorUv = hit.uv;
+        [self pushCursorUvToParsec];
     }
 }
 
@@ -1724,7 +1296,11 @@ namespace
     if (event.allTouches.count <= touches.count)
     {
         self.isTwoFingerScrolling = NO;
-        [self handlePrimaryActionUp];
+        if (self.parsecMouseHeld)
+        {
+            self.parsecMouseHeld = NO;
+            VRParsecSendMouseButton(self.heldMouseButton, 0);
+        }
     }
 }
 
@@ -1733,145 +1309,28 @@ namespace
     (void)touches;
     (void)event;
     self.isTwoFingerScrolling = NO;
-    [self handlePrimaryActionUp];
-}
-
-- (void)handleRayHitDown:(VRRayHit)hit fromDirectTouch:(BOOL)isDirectTouch
-{
-    CFTimeInterval now = CACurrentMediaTime();
-    if (!isDirectTouch)
-    {
-        if (now - self.lastPinchClickAt < 0.16)
-            return;
-        self.lastPinchClickAt = now;
-    }
-
-    if (self.movingMonitorIndex != -2)
-    {
-        [self finishGrabAtCurrentPose];
-        return;
-    }
-
-    if (!hit.node)
-        return;
-
-    int grabIdx = [self grabTargetIndexForGrabNode:hit.node];
-    if (grabIdx != -2)
-    {
-        [self startGrabForIndex:grabIdx];
-        return;
-    }
-
-    CGPoint uv = hit.uv;
-    int maxW = std::max(1, self.hostWidth - 1);
-    int maxH = std::max(1, self.hostHeight - 1);
-
-    if (hit.node == self.palmMenuNode)
-    {
-        self.palmMenuVisibleUntil = now + 4.5;
-        NSString *btnId = [self buttonAtUv:uv inList:_palmMenuHits];
-        if (btnId)
-        {
-            AudioServicesPlaySystemSound(1104);
-            self.flashedButtonId = btnId;
-            self.flashUntil = now + 0.09;
-            [self handleButtonClick:btnId];
-            [self redrawPalmMenuPanel];
-        }
-        return;
-    }
-
-    if (hit.node == self.parsecScreenNode && self.parsecConnected)
-    {
-        self.inputTarget = InputTarget::ParsecHost;
-        int px = static_cast<int>(uv.x * maxW);
-        int py = static_cast<int>(uv.y * maxH);
-        self.lastMousePx = px;
-        self.lastMousePy = py;
-        VRParsecSendStreamMousePosition(0, px, py);
-        int btn = self.rightClickArmed ? 3 : 1;
-        self.heldParsecButton = btn;
-        VRParsecSendMouseButton(btn, 1);
-        self.parsecMouseHeld = YES;
-        self.parsecCursorNode.hidden = NO;
-        SCNPlane *pl = (SCNPlane *)self.parsecScreenNode.geometry;
-        self.parsecCursorNode.position = SCNVector3Make((uv.x - 0.5) * pl.width, (0.5 - uv.y) * pl.height, 0.01f);
-        if (self.rightClickArmed)
-        {
-            self.rightClickArmed = NO;
-            [self redrawDockPanel];
-        }
-        [self redrawKeyboardPanel];
-        return;
-    }
-
-    BOOL isSideBar = NO;
-    int sideIdx = [self sideSlotIndexForNode:hit.node isBar:&isSideBar];
-    if (sideIdx >= 0 && !isSideBar)
-    {
-        self.activeSideSlot = sideIdx;
-        SideMonitorSlot &slot = _sideSlots[sideIdx];
-        if (slot.useParsecStream2 && self.parsecConnected)
-        {
-            self.inputTarget = InputTarget::ParsecHost;
-            int px = static_cast<int>(uv.x * maxW);
-            int py = static_cast<int>(uv.y * maxH);
-            VRParsecSendStreamMousePosition(1, px, py);
-            int btn = self.rightClickArmed ? 3 : 1;
-            self.heldParsecButton = btn;
-            VRParsecSendMouseButton(btn, 1);
-            self.parsecMouseHeld = YES;
-            if (self.rightClickArmed)
-            {
-                self.rightClickArmed = NO;
-                [self redrawDockPanel];
-            }
-        }
-        else
-        {
-            self.inputTarget = InputTarget::WebPage;
-            VRWebClickSlot(sideIdx, static_cast<float>(uv.x), static_cast<float>(uv.y));
-        }
-        [self redrawKeyboardPanel];
-        return;
-    }
-
-    NSString *btnId = nil;
-    if (sideIdx >= 0 && isSideBar) btnId = [self buttonAtUv:uv inList:_sideSlots[sideIdx].barHits];
-    else if (hit.node == self.parsecPanelNode) btnId = [self buttonAtUv:uv inList:_parsecPanelHits];
-    else if (hit.node == self.parsecBarNode) btnId = [self buttonAtUv:uv inList:_parsecBarHits];
-    else if (hit.node == self.dockNode) btnId = [self buttonAtUv:uv inList:_dockHits];
-    else if (hit.node == self.keyboardNode) btnId = [self buttonAtUv:uv inList:_keyboardHits];
-
-    if (btnId)
-    {
-        AudioServicesPlaySystemSound(1104);
-        self.flashedButtonId = btnId;
-        self.flashUntil = now + 0.09;
-        [self handleButtonClick:btnId];
-        [self redrawPanelForNodeName:hit.node.name];
-    }
-}
-
-- (void)handlePrimaryActionUp
-{
     if (self.parsecMouseHeld)
     {
         self.parsecMouseHeld = NO;
-        VRParsecSendMouseButton(self.heldParsecButton, 0);
+        VRParsecSendMouseButton(self.heldMouseButton, 0);
     }
 }
 
+#pragma mark - UI Button Actions & Actions
+
 - (void)handleButtonClick:(NSString *)btnId
 {
-    if ([btnId isEqualToString:@"auth_email"]) { self.inputTarget = InputTarget::ParsecEmail; [self redrawParsecPanel]; [self redrawKeyboardPanel]; return; }
-    if ([btnId isEqualToString:@"auth_pass"]) { self.inputTarget = InputTarget::ParsecPassword; [self redrawParsecPanel]; [self redrawKeyboardPanel]; return; }
-    if ([btnId isEqualToString:@"auth_tfa"]) { self.inputTarget = InputTarget::ParsecTfa; [self redrawParsecPanel]; [self redrawKeyboardPanel]; return; }
+    if ([btnId isEqualToString:@"auth_email"]) { self.loginField = LoginField::Email; [self openQuickSetupAlert]; return; }
+    if ([btnId isEqualToString:@"auth_pass"]) { self.loginField = LoginField::Password; [self openQuickSetupAlert]; return; }
+    if ([btnId isEqualToString:@"auth_tfa"]) { self.loginField = LoginField::Tfa; [self openQuickSetupAlert]; return; }
     if ([btnId isEqualToString:@"auth_signin"]) { [self startParsecSignIn]; return; }
     if ([btnId isEqualToString:@"auth_setup"]) { [self openQuickSetupAlert]; return; }
     if ([btnId isEqualToString:@"hosts_refresh"]) { [self refreshHosts]; return; }
     if ([btnId isEqualToString:@"hosts_signout"]) { [self signOutParsec]; return; }
     if ([btnId isEqualToString:@"connect_cancel"]) { [self cancelConnect]; return; }
+    if ([btnId isEqualToString:@"ipd_minus"]) { [self adjustLensSpacingBy:-0.01f]; return; }
+    if ([btnId isEqualToString:@"ipd_plus"]) { [self adjustLensSpacingBy:0.01f]; return; }
+
     if ([btnId hasPrefix:@"host_"])
     {
         NSInteger idx = [[btnId substringFromIndex:5] integerValue];
@@ -1879,283 +1338,42 @@ namespace
         return;
     }
 
-    if ([btnId isEqualToString:@"pbar_up"]) { VRParsecSendMouseWheel(0, 120); return; }
-    if ([btnId isEqualToString:@"pbar_down"]) { VRParsecSendMouseWheel(0, -120); return; }
-    if ([btnId isEqualToString:@"pbar_disc"]) { [self disconnectParsec]; return; }
-
-    if ([btnId hasPrefix:@"sbar_"])
+    if ([btnId isEqualToString:@"bar_mode"]) { [self toggleGamepadMode]; return; }
+    if ([btnId isEqualToString:@"bar_sz_minus"]) { [self adjustScreenScaleBy:-0.10f]; return; }
+    if ([btnId isEqualToString:@"bar_sz_plus"]) { [self adjustScreenScaleBy:0.10f]; return; }
+    if ([btnId isEqualToString:@"bar_ipd_minus"]) { [self adjustLensSpacingBy:-0.01f]; return; }
+    if ([btnId isEqualToString:@"bar_ipd_plus"]) { [self adjustLensSpacingBy:0.01f]; return; }
+    if ([btnId isEqualToString:@"bar_lock"])
     {
-        NSArray<NSString *> *parts = [btnId componentsSeparatedByString:@"_"];
-        if (parts.count == 3)
-        {
-            int slotIdx = [parts[1] intValue];
-            NSString *act = parts[2];
-            if (slotIdx >= 0 && slotIdx < kMaxWebMonitors)
-            {
-                self.activeSideSlot = slotIdx;
-                SideMonitorSlot &slot = _sideSlots[slotIdx];
-                if ([act isEqualToString:@"src"])
-                {
-                    slot.useParsecStream2 = !slot.useParsecStream2;
-                    [self syncSecondParsecStream];
-                    [self redrawSideBar:slotIdx];
-                }
-                else if ([act isEqualToString:@"back"]) { VRWebGoBackSlot(slotIdx); }
-                else if ([act isEqualToString:@"fwd"]) { VRWebGoForwardSlot(slotIdx); }
-                else if ([act isEqualToString:@"reload"]) { VRWebReloadSlot(slotIdx); }
-                else if ([act isEqualToString:@"url"]) { self.inputTarget = InputTarget::WebUrl; [self redrawSideBar:slotIdx]; [self redrawKeyboardPanel]; }
-                else if ([act isEqualToString:@"yt"]) { [self navigateSideSlot:slotIdx url:@"https://www.youtube.com"]; }
-                else if ([act isEqualToString:@"dc"]) { [self navigateSideSlot:slotIdx url:@"https://discord.com/app"]; }
-                else if ([act isEqualToString:@"ai"]) { [self navigateSideSlot:slotIdx url:@"https://chatgpt.com"]; }
-                else if ([act isEqualToString:@"up"]) { VRWebScrollSlot(slotIdx, 0.5f, 0.5f, -360.0f); }
-                else if ([act isEqualToString:@"dn"]) { VRWebScrollSlot(slotIdx, 0.5f, 0.5f, 360.0f); }
-                else if ([act isEqualToString:@"move"])
-                {
-                    [self startGrabForIndex:slotIdx];
-                }
-                else if ([act isEqualToString:@"close"])
-                {
-                    slot.active = NO;
-                    slot.useParsecStream2 = NO;
-                    [self syncSecondParsecStream];
-                    [self applyWorkspaceVisibility];
-                    [self redrawDockPanel];
-                }
-            }
-        }
+        self.headLockMode = !self.headLockMode;
+        [self redrawParsecBar];
         return;
     }
-
-    if ([btnId isEqualToString:@"dock_addmon"] || [btnId isEqualToString:@"palm_addmon"])
-    {
-        for (int i = 0; i < kMaxWebMonitors; ++i)
-        {
-            if (!_sideSlots[i].active)
-            {
-                _sideSlots[i].active = YES;
-                VRWebInitSlot(i, 1280, 800, _sideSlots[i].urlText.UTF8String);
-                [self resetSideSlotPose:i];
-                [self applyWorkspaceVisibility];
-                [self redrawSideBar:i];
-                [self redrawDockPanel];
-                [self redrawPalmMenuPanel];
-                break;
-            }
-        }
-        return;
-    }
-    if ([btnId isEqualToString:@"dock_size"] || [btnId isEqualToString:@"palm_size"])
-    {
-        self.screenSizePreset = (self.screenSizePreset + 1) % 3;
-        [self applyMonitorSizes];
-        [self redrawDockPanel];
-        [self redrawPalmMenuPanel];
-        return;
-    }
-    if ([btnId isEqualToString:@"dock_movepc"])
-    {
-        [self startGrabForIndex:-1];
-        return;
-    }
-    if ([btnId isEqualToString:@"palm_grab"])
-    {
-        int target = (self.lastFocusedTargetIndex >= -1) ? self.lastFocusedTargetIndex : -1;
-        [self startGrabForIndex:target];
-        self.palmMenuVisibleUntil = 0.0;
-        self.palmMenuNode.hidden = YES;
-        return;
-    }
-    if ([btnId isEqualToString:@"palm_kb"])
-    {
-        self.keyboardVisible = YES;
-        SCNVector3 origin = SCNVector3Zero, dir = SCNVector3Make(0, 0, -1);
-        [self computeActiveRayOrigin:&origin dir:&dir];
-        SCNVector3 wt = SCNVector3Make(origin.x + dir.x * 0.65f, origin.y - 0.34f, origin.z + dir.z * 0.65f);
-        SCNVector3 lt = [self.workspaceRoot convertPosition:wt fromNode:self.scene.rootNode];
-        self.keyboardNode.position = lt;
-        SCNVector3 hl = [self.workspaceRoot convertPosition:[self.headNode convertPosition:SCNVector3Zero toNode:self.scene.rootNode]
-                                                   fromNode:self.scene.rootNode];
-        float yaw = atan2f(hl.x - lt.x, hl.z - lt.z);
-        self.keyboardNode.eulerAngles = SCNVector3Make(kKeyboardPitchDeg * M_PI / 180.0f, yaw, 0);
-        [self applyWorkspaceVisibility];
-        [self redrawDockPanel];
-        return;
-    }
-    if ([btnId isEqualToString:@"palm_close"])
-    {
-        self.palmMenuVisibleUntil = 0.0;
-        self.palmMenuNode.hidden = YES;
-        return;
-    }
-    if ([btnId isEqualToString:@"dock_kb"]) { self.keyboardVisible = !self.keyboardVisible; [self applyWorkspaceVisibility]; [self redrawDockPanel]; return; }
-    if ([btnId isEqualToString:@"dock_rclick"]) { self.rightClickArmed = !self.rightClickArmed; [self redrawDockPanel]; return; }
-    if ([btnId isEqualToString:@"dock_mute"]) { self.muted = !self.muted; VRParsecSetMuted(self.muted ? 1 : 0); [self redrawDockPanel]; return; }
-    if ([btnId isEqualToString:@"dock_handaim"])
-    {
-        self.handTrackingEnabled = !self.handTrackingEnabled;
-        if (!self.handTrackingEnabled)
-        {
-            self.handTracked = NO;
-            self.pinchClosed = NO;
-            self.fingerPoking = NO;
-            self.fingerPokePending = NO;
-            self.palmMenuVisibleUntil = 0.0;
-            self.palmMenuNode.hidden = YES;
-            _steadyHandFrames = 0;
-            [self hideHandSkeleton];
-        }
-        [self redrawDockPanel];
-        return;
-    }
-    if ([btnId isEqualToString:@"dock_recenter"] || [btnId isEqualToString:@"palm_recenter"])
-    {
-        self.movingMonitorIndex = -2;
-        self.mainAnchorNode.position = SCNVector3Make(0, 0.42f, -kParsecDist);
-        self.mainAnchorNode.eulerAngles = SCNVector3Make(4.0f * M_PI / 180.0f, 0, 0);
-        self.keyboardNode.position = SCNVector3Make(0, -0.48f, -kKeyboardDist);
-        self.keyboardNode.eulerAngles = SCNVector3Make(kKeyboardPitchDeg * M_PI / 180.0f, 0, 0);
-        self.dockNode.position = SCNVector3Make(0, -0.78f, -0.62f);
-        self.dockNode.eulerAngles = SCNVector3Make(-34.0f * M_PI / 180.0f, 0, 0);
-        for (int i = 0; i < kMaxWebMonitors; ++i)
-            [self resetSideSlotPose:i];
-        [self recenterWorkspace];
-        [self redrawGrabBars];
-        [self redrawDockPanel];
-        [self redrawPalmMenuPanel];
-        return;
-    }
-    if ([btnId isEqualToString:@"dock_room"] || [btnId isEqualToString:@"palm_room"])
+    if ([btnId isEqualToString:@"bar_room"])
     {
         self.passthroughOn = !self.passthroughOn;
-        self.floorNode.hidden = self.passthroughOn;
         if (!self.passthroughOn)
-            self.scene.background.contents = ColorHex(0x141218);
-        [self redrawDockPanel];
-        [self redrawPalmMenuPanel];
+            self.scene.background.contents = [UIColor blackColor];
+        [self redrawParsecBar];
         return;
     }
-
-    if ([btnId hasPrefix:@"kb_"])
+    if ([btnId isEqualToString:@"bar_mute"])
     {
-        [self handleKeyboardButton:[btnId substringFromIndex:3]];
+        self.muted = !self.muted;
+        VRParsecSetMuted(self.muted ? 1 : 0);
+        [self redrawParsecBar];
+        return;
     }
-}
-
-- (void)syncSecondParsecStream
-{
-    BOOL need2 = NO;
-    for (int i = 0; i < kMaxWebMonitors; ++i)
+    if ([btnId isEqualToString:@"bar_recenter"])
     {
-        if (_sideSlots[i].active && _sideSlots[i].useParsecStream2)
-            need2 = YES;
+        [self recenterWorkspace];
+        [self redrawParsecBar];
+        return;
     }
-    VRParsecSetSecondStreamEnabled(need2 ? 1 : 0);
-}
-
-- (void)handleKeyboardButton:(NSString *)keyName
-{
-    if ([keyName isEqualToString:@"SHIFT"]) { self.shiftOn = !self.shiftOn; if (self.inputTarget == InputTarget::ParsecHost) VRParsecSendKey(225, self.shiftOn); [self redrawKeyboardPanel]; return; }
-    if ([keyName isEqualToString:@"CTRL"]) { self.ctrlOn = !self.ctrlOn; if (self.inputTarget == InputTarget::ParsecHost) VRParsecSendKey(224, self.ctrlOn); [self redrawKeyboardPanel]; return; }
-    if ([keyName isEqualToString:@"ALT"]) { self.altOn = !self.altOn; if (self.inputTarget == InputTarget::ParsecHost) VRParsecSendKey(226, self.altOn); [self redrawKeyboardPanel]; return; }
-    if ([keyName isEqualToString:@"WIN"]) { self.winOn = !self.winOn; if (self.inputTarget == InputTarget::ParsecHost) VRParsecSendKey(227, self.winOn); [self redrawKeyboardPanel]; return; }
-
-    BOOL isBksp = [keyName isEqualToString:@"BKSP"];
-    BOOL isEnter = [keyName isEqualToString:@"ENTER"];
-    BOOL isSpace = [keyName isEqualToString:@"SPACE"];
-    BOOL isTab = [keyName isEqualToString:@"TAB"];
-    BOOL isEsc = [keyName isEqualToString:@"ESC"];
-    NSString *text = isSpace ? @" " : keyName;
-    if (isBksp || isEnter || isTab || isEsc ||
-        [keyName isEqualToString:@"DEL"] || [keyName isEqualToString:@"UP"] ||
-        [keyName isEqualToString:@"DOWN"] || [keyName isEqualToString:@"LEFT"] || [keyName isEqualToString:@"RIGHT"])
-        text = @"";
-
-    if (self.inputTarget == InputTarget::ParsecHost)
+    if ([btnId isEqualToString:@"bar_disc"])
     {
-        int code = 0;
-        if (isEnter) code = 40;
-        else if (isEsc) code = 41;
-        else if (isBksp) code = 42;
-        else if (isTab) code = 43;
-        else if (isSpace) code = 44;
-        else if ([keyName isEqualToString:@"DEL"]) code = 76;
-        else if ([keyName isEqualToString:@"RIGHT"]) code = 79;
-        else if ([keyName isEqualToString:@"LEFT"]) code = 80;
-        else if ([keyName isEqualToString:@"DOWN"]) code = 81;
-        else if ([keyName isEqualToString:@"UP"]) code = 82;
-
-        if (code != 0)
-        {
-            VRParsecSendKey(code, 1);
-            VRParsecSendKey(code, 0);
-        }
-        else if (text.length > 0)
-        {
-            const char *utf8 = text.UTF8String;
-            for (size_t i = 0; utf8 && utf8[i] != '\0'; ++i)
-            {
-                BOOL needsShift = NO;
-                int chCode = MapCharToUsbHid(utf8[i], &needsShift);
-                if (chCode != 0)
-                {
-                    if (needsShift && !self.shiftOn) VRParsecSendKey(225, 1);
-                    VRParsecSendKey(chCode, 1);
-                    VRParsecSendKey(chCode, 0);
-                    if (needsShift && !self.shiftOn) VRParsecSendKey(225, 0);
-                }
-            }
-        }
-    }
-    else if (self.inputTarget == InputTarget::WebPage)
-    {
-        VRWebTypeKeySlot(self.activeSideSlot, text.UTF8String, isBksp ? 1 : 0, isEnter ? 1 : 0);
-    }
-    else
-    {
-        if (isEnter)
-        {
-            if (self.inputTarget == InputTarget::WebUrl) [self navigateSideSlot:self.activeSideSlot url:_sideSlots[self.activeSideSlot].urlText];
-            else [self startParsecSignIn];
-        }
-        else if (isTab)
-        {
-            if (self.inputTarget == InputTarget::ParsecEmail) self.inputTarget = InputTarget::ParsecPassword;
-            else if (self.inputTarget == InputTarget::ParsecPassword && self.requiresTfa) self.inputTarget = InputTarget::ParsecTfa;
-            else if (self.inputTarget != InputTarget::WebUrl) self.inputTarget = InputTarget::ParsecEmail;
-            [self redrawParsecPanel];
-        }
-        else
-        {
-            NSString *cur = @"";
-            if (self.inputTarget == InputTarget::ParsecEmail) cur = self.emailText;
-            else if (self.inputTarget == InputTarget::ParsecPassword) cur = self.passwordText;
-            else if (self.inputTarget == InputTarget::ParsecTfa) cur = self.tfaText;
-            else if (self.inputTarget == InputTarget::WebUrl) cur = _sideSlots[self.activeSideSlot].urlText;
-
-            if (isBksp)
-                cur = cur.length > 0 ? [cur substringToIndex:cur.length - 1] : @"";
-            else
-                cur = [cur stringByAppendingString:text];
-
-            if (self.inputTarget == InputTarget::ParsecEmail) self.emailText = cur;
-            else if (self.inputTarget == InputTarget::ParsecPassword) self.passwordText = cur;
-            else if (self.inputTarget == InputTarget::ParsecTfa) self.tfaText = cur;
-            else if (self.inputTarget == InputTarget::WebUrl)
-            {
-                _sideSlots[self.activeSideSlot].urlText = cur;
-                [self redrawSideBar:self.activeSideSlot];
-            }
-
-            [self redrawParsecPanel];
-        }
-    }
-
-    if (self.shiftOn)
-    {
-        self.shiftOn = NO;
-        if (self.inputTarget == InputTarget::ParsecHost)
-            VRParsecSendKey(225, 0);
-        [self redrawKeyboardPanel];
+        [self disconnectParsec];
+        return;
     }
 }
 
@@ -2166,8 +1384,8 @@ namespace
     float fx = -m.m31;
     float fz = -m.m33;
     float yaw = atan2f(-fx, -fz);
-    self.workspaceRoot.position = pos;
-    self.workspaceRoot.eulerAngles = SCNVector3Make(0, yaw, 0);
+    self.cinemaRootNode.position = pos;
+    self.cinemaRootNode.eulerAngles = SCNVector3Make(0, yaw, 0);
 }
 
 - (void)applyWorkspaceVisibility
@@ -2175,13 +1393,11 @@ namespace
     self.parsecScreenNode.hidden = !self.parsecConnected;
     self.parsecBarNode.hidden = !self.parsecConnected;
     self.parsecPanelNode.hidden = self.parsecConnected;
-    self.mainGrabNode.position = SCNVector3Make(0, self.parsecConnected ? -0.69f : -0.50f, 0.01f);
-
-    for (int i = 0; i < kMaxWebMonitors; ++i)
-        _sideSlots[i].anchorNode.hidden = !_sideSlots[i].active;
-
-    self.keyboardNode.hidden = !self.keyboardVisible;
+    self.parsecCursorNode.hidden = !self.parsecConnected || self.gamepadPassthroughMode;
+    [self updateStereoOrFullLayout];
 }
+
+#pragma mark - Parsec Stream & Auth
 
 - (void)updateParsecStream
 {
@@ -2190,10 +1406,11 @@ namespace
 
     int hw = 1920, hh = 1080, netFail = 0;
     int st = VRParsecGetStatus(&hw, &hh, &netFail);
-    if (hw > 0 && hh > 0)
+    if (hw > 0 && hh > 0 && (hw != self.hostWidth || hh != self.hostHeight))
     {
         self.hostWidth = hw;
         self.hostHeight = hh;
+        [self applyScreenLayoutAndScale];
     }
 
     if (self.parsecConnecting)
@@ -2202,11 +1419,10 @@ namespace
         {
             self.parsecConnecting = NO;
             self.parsecConnected = YES;
-            self.inputTarget = InputTarget::ParsecHost;
-            [self syncSecondParsecStream];
+            [self applyScreenLayoutAndScale];
             [self applyWorkspaceVisibility];
-            [self redrawParsecBarWithWidth:hw height:hh netFail:netFail != 0];
-            [self redrawKeyboardPanel];
+            [self pushCursorUvToParsec];
+            [self redrawParsecBar];
         }
         else if (st == 6 || st == 20)
         {
@@ -2222,7 +1438,7 @@ namespace
         {
             self.parsecConnecting = NO;
             VRParsecDisconnect();
-            self.parsecStateMessage = [NSString stringWithFormat:@"Connection failed (%@). Retry or check host.", FormatParsecStatus(st)];
+            self.parsecStateMessage = [NSString stringWithFormat:@"Connection failed (%@). Press X or A to retry.", FormatParsecStatus(st)];
             self.parsecStateIsError = YES;
             [self redrawParsecPanel];
         }
@@ -2234,6 +1450,7 @@ namespace
         if (st != 0 && st != 10)
         {
             self.parsecConnected = NO;
+            self.gamepadPassthroughMode = NO;
             VRParsecDisconnect();
             self.parsecStateMessage = [NSString stringWithFormat:@"Disconnected (%@).", FormatParsecStatus(st)];
             self.parsecStateIsError = YES;
@@ -2245,49 +1462,6 @@ namespace
         id tex0 = VRParsecPollStreamTexture(0, &updated0);
         if (updated0 && tex0)
             self.parsecScreenNode.geometry.firstMaterial.diffuse.contents = tex0;
-
-        int updated1 = 0;
-        id tex1 = nil;
-        BOOL checked1 = NO;
-        for (int i = 0; i < kMaxWebMonitors; ++i)
-        {
-            if (_sideSlots[i].active && _sideSlots[i].useParsecStream2)
-            {
-                if (!checked1)
-                {
-                    tex1 = VRParsecPollStreamTexture(1, &updated1);
-                    checked1 = YES;
-                }
-                if (updated1 && tex1)
-                    _sideSlots[i].screenNode.geometry.firstMaterial.diffuse.contents = tex1;
-            }
-        }
-    }
-}
-
-- (void)updateSideStreams:(CFTimeInterval)now
-{
-    if (now < self.nextWebSnapshotAt)
-        return;
-    self.nextWebSnapshotAt = now + (1.0 / 18.0);
-
-    for (int i = 0; i < kMaxWebMonitors; ++i)
-    {
-        SideMonitorSlot &slot = _sideSlots[i];
-        if (!slot.active || slot.useParsecStream2)
-            continue;
-        UIImage *snap = VRWebSnapshotSlot(i);
-        if (snap)
-            slot.screenNode.geometry.firstMaterial.diffuse.contents = snap;
-        NSString *liveUrl = VRWebGetUrlSlot(i);
-        if (liveUrl.length > 0 && !(self.inputTarget == InputTarget::WebUrl && self.activeSideSlot == i))
-        {
-            if (![slot.urlText isEqualToString:liveUrl])
-            {
-                slot.urlText = liveUrl;
-                [self redrawSideBar:i];
-            }
-        }
     }
 }
 
@@ -2309,17 +1483,17 @@ namespace
 
 - (void)openQuickSetupAlert
 {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Parsec Sign In"
-                                                                   message:@"Sign in once; your session is stored in iOS Keychain."
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Parsec & VR Box Setup"
+                                                                   message:@"Sign in once; saved in iOS Keychain. Adjust VR Box Goz Araligi anytime with Xbox D-Pad Left/Right."
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"Email";
+        tf.placeholder = @"Parsec Email";
         tf.text = self.emailText;
         tf.keyboardType = UIKeyboardTypeEmailAddress;
         tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
     }];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"Password";
+        tf.placeholder = @"Parsec Password";
         tf.text = self.passwordText;
         tf.secureTextEntry = YES;
     }];
@@ -2331,6 +1505,14 @@ namespace
             tf.keyboardType = UIKeyboardTypeNumberPad;
         }];
     }
+    [alert addAction:[UIAlertAction actionWithTitle:@"VR Box Goz -" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        (void)a;
+        [self adjustLensSpacingBy:-0.015f];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"VR Box Goz +" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        (void)a;
+        [self adjustLensSpacingBy:0.015f];
+    }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
     [alert addAction:[UIAlertAction actionWithTitle:@"Sign In" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         (void)a;
@@ -2349,7 +1531,7 @@ namespace
         return;
     if (self.emailText.length == 0 || self.passwordText.length == 0)
     {
-        self.parsecStateMessage = @"Both email and password are required.";
+        self.parsecStateMessage = @"Tap 'Parsec Setup' in top-left corner to sign in.";
         self.parsecStateIsError = YES;
         [self redrawParsecPanel];
         return;
@@ -2388,14 +1570,14 @@ namespace
                 NSString *raw = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
                 if (raw) VRKeychainSave(kKeychainSessionKey, raw.UTF8String);
                 self.showsHostList = YES;
+                self.selectedMenuIndex = 0;
                 [self refreshHosts];
                 return;
             }
             if ([json[@"tfa_required"] boolValue])
             {
                 self.requiresTfa = YES;
-                self.inputTarget = InputTarget::ParsecTfa;
-                self.parsecStateMessage = @"Enter 2FA code from your authenticator app.";
+                self.parsecStateMessage = @"2FA code required. Tap Parsec Setup top-left.";
                 self.parsecStateIsError = NO;
                 [self redrawParsecPanel];
                 return;
@@ -2413,7 +1595,7 @@ namespace
         return;
 
     self.isHostsBusy = YES;
-    self.parsecStateMessage = @"Fetching your online Parsec computers...";
+    self.parsecStateMessage = @"Fetching your online Parsec PCs...";
     self.parsecStateIsError = NO;
     [self redrawParsecPanel];
 
@@ -2430,7 +1612,7 @@ namespace
             if (code == 401)
             {
                 [self signOutParsec];
-                self.parsecStateMessage = @"Session expired. Please sign in again.";
+                self.parsecStateMessage = @"Session expired. Sign in via Parsec Setup.";
                 self.parsecStateIsError = YES;
                 [self redrawParsecPanel];
                 return;
@@ -2445,10 +1627,11 @@ namespace
             NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
             NSArray *list = [json[@"data"] isKindOfClass:[NSArray class]] ? json[@"data"] : @[];
             self.hosts = list;
+            self.selectedMenuIndex = 0;
             if (list.count == 0)
-                self.parsecStateMessage = @"No online hosts found. Start Parsec on your PC, then Refresh.";
+                self.parsecStateMessage = @"No online PC found. Start Parsec on your PC, press X to Refresh.";
             else
-                self.parsecStateMessage = [NSString stringWithFormat:@"Select a computer (%lu online):", (unsigned long)list.count];
+                self.parsecStateMessage = [NSString stringWithFormat:@"Select PC (%lu online) - Press A on Xbox Controller:", (unsigned long)list.count];
             self.parsecStateIsError = NO;
             [self redrawParsecPanel];
         });
@@ -2481,17 +1664,24 @@ namespace
 {
     self.parsecConnecting = NO;
     VRParsecDisconnect();
-    self.parsecStateMessage = @"Connection canceled. Pick a host or Refresh.";
+    self.parsecStateMessage = @"Canceled. Pick a PC or press X to Refresh.";
     self.parsecStateIsError = NO;
     [self redrawParsecPanel];
 }
 
 - (void)disconnectParsec
 {
+    if (self.gamepadPassthroughMode)
+    {
+        VRParsecSendGamepadState(0, 0, 0, 0, 0, 0, 0);
+        VRParsecUnplugGamepad();
+    }
+    self.gamepadPassthroughMode = NO;
+    self.parsecMouseHeld = NO;
     self.parsecConnected = NO;
     self.parsecConnecting = NO;
     VRParsecDisconnect();
-    self.parsecStateMessage = @"Disconnected. Pick a host to reconnect.";
+    self.parsecStateMessage = @"Disconnected. Pick a PC to reconnect.";
     self.parsecStateIsError = NO;
     [self applyWorkspaceVisibility];
     [self redrawParsecPanel];
@@ -2499,133 +1689,29 @@ namespace
 
 - (void)signOutParsec
 {
+    if (self.gamepadPassthroughMode)
+    {
+        VRParsecSendGamepadState(0, 0, 0, 0, 0, 0, 0);
+        VRParsecUnplugGamepad();
+    }
+    self.gamepadPassthroughMode = NO;
     self.sessionId = @"";
     self.hosts = @[];
     self.showsHostList = NO;
     self.parsecConnected = NO;
     self.parsecConnecting = NO;
     VRKeychainDelete(kKeychainSessionKey);
-    self.parsecStateMessage = @"Signed out. Enter email and password.";
+    self.parsecStateMessage = @"Signed out. Tap Parsec Setup top-left.";
     self.parsecStateIsError = NO;
     [self redrawParsecPanel];
 }
 
-- (void)navigateSideSlot:(int)slotIdx url:(NSString *)url
-{
-    if (slotIdx < 0 || slotIdx >= kMaxWebMonitors) return;
-    NSString *trimmed = [url stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (trimmed.length == 0)
-        return;
-    if (![trimmed hasPrefix:@"http://"] && ![trimmed hasPrefix:@"https://"])
-        trimmed = [@"https://" stringByAppendingString:trimmed];
-    _sideSlots[slotIdx].urlText = trimmed;
-    self.activeSideSlot = slotIdx;
-    self.inputTarget = InputTarget::WebPage;
-    VRWebLoadUrlSlot(slotIdx, trimmed.UTF8String);
-    [self redrawSideBar:slotIdx];
-    [self redrawKeyboardPanel];
-}
+#pragma mark - Canvas Rendering (Parsec Panel + Cinema HUD Bar)
 
-#pragma mark - Material 3 Canvas Renderers
-
-- (void)redrawAllUiPanels
+- (void)redrawAllPanels
 {
     [self redrawParsecPanel];
-    [self redrawParsecBarWithWidth:1920 height:1080 netFail:NO];
-    for (int i = 0; i < kMaxWebMonitors; ++i)
-        [self redrawSideBar:i];
-    [self redrawDockPanel];
-    [self redrawKeyboardPanel];
-    [self redrawGrabBars];
-    [self redrawPalmMenuPanel];
-}
-
-- (void)redrawPanelForNodeName:(NSString *)name
-{
-    if (!name) return;
-    if ([name isEqualToString:@"parsec_panel"]) [self redrawParsecPanel];
-    else if ([name isEqualToString:@"parsec_bar"]) [self redrawParsecBarWithWidth:1920 height:1080 netFail:NO];
-    else if ([name isEqualToString:@"dock"]) [self redrawDockPanel];
-    else if ([name isEqualToString:@"keyboard"]) [self redrawKeyboardPanel];
-    else if ([name isEqualToString:@"palm_menu"]) [self redrawPalmMenuPanel];
-    else if ([name hasPrefix:@"side_bar_"]) [self redrawSideBar:[[name substringFromIndex:9] intValue]];
-}
-
-- (UIImage *)createGrabHandleImage:(NSString *)label active:(BOOL)active width:(CGFloat)w height:(CGFloat)h
-{
-    CGSize sz = CGSizeMake(w, h);
-    UIGraphicsImageRenderer *r = [self makeUiRendererWithSize:sz];
-    return [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        (void)ctx;
-        UIColor *bg = active ? ColorHex(0x80E5A3, 0.96) : ColorHex(0x332F3D, 0.92);
-        UIColor *fg = active ? ColorHex(0x0D2818) : ColorHex(0xD0BCFF);
-        [bg setFill];
-        [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(2, 2, sz.width - 4, sz.height - 4) cornerRadius:sz.height * 0.45] fill];
-        [fg setStroke];
-        UIBezierPath *border = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(2, 2, sz.width - 4, sz.height - 4) cornerRadius:sz.height * 0.45];
-        border.lineWidth = 2.5;
-        [border stroke];
-        [self drawText:label rect:CGRectMake(10, (sz.height - 24) * 0.5, sz.width - 20, 24) size:19 color:fg bold:YES align:NSTextAlignmentCenter];
-    }];
-}
-
-- (void)redrawGrabBars
-{
-    self.mainGrabNode.geometry.firstMaterial.diffuse.contents =
-        [self createGrabHandleImage:(self.movingMonitorIndex == -1 ? @"Drop Main Screen" : @"Grab & Move 6DoF")
-                             active:(self.movingMonitorIndex == -1) width:420 height:52];
-    self.keyboardGrabNode.geometry.firstMaterial.diffuse.contents =
-        [self createGrabHandleImage:(self.movingMonitorIndex == 10 ? @"Drop Keyboard" : @"Move Keyboard")
-                             active:(self.movingMonitorIndex == 10) width:340 height:46];
-    self.dockGrabNode.geometry.firstMaterial.diffuse.contents =
-        [self createGrabHandleImage:(self.movingMonitorIndex == 11 ? @"Drop Controls" : @"Move Controls")
-                             active:(self.movingMonitorIndex == 11) width:340 height:44];
-    for (int i = 0; i < kMaxWebMonitors; ++i)
-    {
-        _sideSlots[i].grabNode.geometry.firstMaterial.diffuse.contents =
-            [self createGrabHandleImage:(self.movingMonitorIndex == i ? @"Drop Monitor" : @"Grab & Move 6DoF")
-                                 active:(self.movingMonitorIndex == i) width:380 height:48];
-    }
-}
-
-- (void)redrawPalmMenuPanel
-{
-    _palmMenuHits.clear();
-    CGSize sz = CGSizeMake(640, 400);
-    UIGraphicsImageRenderer *r = [self makeUiRendererWithSize:sz];
-    NSString *sizeLabel = self.screenSizePreset == 0 ? @"Size: Big" : (self.screenSizePreset == 1 ? @"Size: Giant" : @"Size: IMAX");
-    BOOL grabbing = (self.movingMonitorIndex != -2);
-
-    UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        (void)ctx;
-        [ColorHex(0x1D1B22, 0.96) setFill];
-        [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, sz.width, sz.height) cornerRadius:32] fill];
-        [ColorHex(0xD0BCFF, 0.6) setStroke];
-        UIBezierPath *ring = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(2, 2, sz.width - 4, sz.height - 4) cornerRadius:32];
-        ring.lineWidth = 3.0;
-        [ring stroke];
-
-        [self drawText:@"Hand Menu (6DoF)" rect:CGRectMake(26, 20, 490, 38) size:26 color:ColorHex(0xE6E0E9) bold:YES align:NSTextAlignmentLeft];
-        [self drawButton:CGRectMake(544, 16, 72, 50) canvas:sz buttonId:@"palm_close" title:@"X" selected:NO outlined:YES filled:NO disabled:NO hitList:_palmMenuHits];
-
-        [self drawButton:CGRectMake(24, 86, 286, 84) canvas:sz buttonId:@"palm_addmon" title:@"+ Add Monitor"
-                selected:NO outlined:NO filled:YES disabled:NO hitList:_palmMenuHits];
-        [self drawButton:CGRectMake(330, 86, 286, 84) canvas:sz buttonId:@"palm_grab"
-                   title:(grabbing ? @"Drop Window" : @"Grab Window")
-                selected:grabbing outlined:NO filled:NO disabled:NO hitList:_palmMenuHits];
-
-        [self drawButton:CGRectMake(24, 190, 286, 84) canvas:sz buttonId:@"palm_kb" title:@"Keyboard Here"
-                selected:NO outlined:NO filled:NO disabled:NO hitList:_palmMenuHits];
-        [self drawButton:CGRectMake(330, 190, 286, 84) canvas:sz buttonId:@"palm_recenter" title:@"Recenter 6DoF"
-                selected:NO outlined:YES filled:NO disabled:NO hitList:_palmMenuHits];
-
-        [self drawButton:CGRectMake(24, 294, 286, 84) canvas:sz buttonId:@"palm_size" title:sizeLabel
-                selected:(self.screenSizePreset > 0) outlined:NO filled:NO disabled:NO hitList:_palmMenuHits];
-        [self drawButton:CGRectMake(330, 294, 286, 84) canvas:sz buttonId:@"palm_room"
-                   title:(self.passthroughOn ? @"Passthrough: ON" : @"VR Grid Mode")
-                selected:self.passthroughOn outlined:NO filled:NO disabled:NO hitList:_palmMenuHits];
-    }];
-    self.palmMenuNode.geometry.firstMaterial.diffuse.contents = img;
+    [self redrawParsecBar];
 }
 
 - (void)drawButton:(CGRect)pxRect
@@ -2633,29 +1719,35 @@ namespace
           buttonId:(NSString *)btnId
              title:(NSString *)title
           selected:(BOOL)selected
+       xboxFocused:(BOOL)xboxFocused
           outlined:(BOOL)outlined
             filled:(BOOL)filled
           disabled:(BOOL)disabled
            hitList:(std::vector<VRButtonHit> &)hits
 {
-    BOOL flashed = [self.flashedButtonId isEqualToString:btnId] && CACurrentMediaTime() < self.flashUntil;
-
-    UIColor *bg = ColorHex(0x4A4458);
+    UIColor *bg = ColorHex(0x3B3746);
     UIColor *fg = ColorHex(0xE8DEF8);
-    if (flashed || filled || selected) { bg = ColorHex(0xD0BCFF); fg = ColorHex(0x381E72); }
-    else if (outlined) { bg = ColorHex(0x2B2930); fg = ColorHex(0xE6E0E9); }
+    if (filled || selected) { bg = ColorHex(0xD0BCFF); fg = ColorHex(0x2F1665); }
+    else if (outlined) { bg = ColorHex(0x25232A); fg = ColorHex(0xE6E0E9); }
     if (disabled)
     {
-        bg = ColorHex(0x36343B, 0.5);
+        bg = ColorHex(0x2C2A31, 0.55);
         fg = ColorHex(0x938F99);
     }
 
-    UIBezierPath *path = [UIBezierPath bezierPathWithRoundedRect:pxRect cornerRadius:MIN(14.0, pxRect.size.height * 0.45)];
+    UIBezierPath *path = [UIBezierPath bezierPathWithRoundedRect:pxRect cornerRadius:MIN(14.0, pxRect.size.height * 0.42)];
     [bg setFill];
     [path fill];
-    if (outlined)
+
+    if (xboxFocused)
     {
-        [ColorHex(0x938F99) setStroke];
+        [ColorHex(0x5EEAD4) setStroke];
+        path.lineWidth = 4.0;
+        [path stroke];
+    }
+    else if (outlined)
+    {
+        [ColorHex(0x888392) setStroke];
         path.lineWidth = 1.5;
         [path stroke];
     }
@@ -2664,12 +1756,12 @@ namespace
     ps.alignment = NSTextAlignmentCenter;
     ps.lineBreakMode = NSLineBreakByTruncatingTail;
     NSDictionary *attrs = @{
-        NSFontAttributeName: [UIFont systemFontOfSize:MAX(16.0, MIN(28.0, pxRect.size.height * 0.36)) weight:UIFontWeightSemibold],
+        NSFontAttributeName: [UIFont systemFontOfSize:MAX(16.0, MIN(26.0, pxRect.size.height * 0.36)) weight:UIFontWeightSemibold],
         NSForegroundColorAttributeName: fg,
         NSParagraphStyleAttributeName: ps
     };
     CGSize tSz = [title sizeWithAttributes:attrs];
-    CGRect tRect = CGRectMake(pxRect.origin.x + 8, pxRect.origin.y + (pxRect.size.height - tSz.height) * 0.5, pxRect.size.width - 16, tSz.height);
+    CGRect tRect = CGRectMake(pxRect.origin.x + 10, pxRect.origin.y + (pxRect.size.height - tSz.height) * 0.5, pxRect.size.width - 20, tSz.height);
     [title drawInRect:tRect withAttributes:attrs];
 
     CGRect uv = CGRectMake(pxRect.origin.x / canvasSize.width,
@@ -2695,242 +1787,124 @@ namespace
 - (void)redrawParsecPanel
 {
     _parsecPanelHits.clear();
-    CGSize sz = CGSizeMake(920, 660);
+    CGSize sz = CGSizeMake(960, 680);
     UIGraphicsImageRenderer *r = [self makeUiRendererWithSize:sz];
+    NSString *ctrlText = self.activeController
+        ? [NSString stringWithFormat:@"Xbox Kolu: BAGLI (%@)", self.activeController.vendorName ?: @"Gamepad"]
+        : @"Xbox Kolu: Bekleniyor (Bluetooth ile eslestir)";
+    UIColor *ctrlColor = self.activeController ? ColorHex(0x80E5A3) : ColorHex(0xF6C177);
+
     UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
         (void)ctx;
-        [ColorHex(0x211F26, 0.96) setFill];
-        [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, sz.width, sz.height) cornerRadius:36] fill];
+        [ColorHex(0x1D1B22, 0.96) setFill];
+        [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, sz.width, sz.height) cornerRadius:34] fill];
 
-        [self drawText:@"Parsec Remote Desktop" rect:CGRectMake(40, 30, 840, 42) size:32 color:ColorHex(0xE6E0E9) bold:YES align:NSTextAlignmentLeft];
-        [self drawText:self.parsecStateMessage rect:CGRectMake(40, 80, 840, 56) size:21
+        [self drawText:@"VR Box Parsec Cinema" rect:CGRectMake(40, 26, 520, 42) size:32 color:ColorHex(0xE6E0E9) bold:YES align:NSTextAlignmentLeft];
+        [self drawText:ctrlText rect:CGRectMake(40, 72, 880, 28) size:19 color:ctrlColor bold:YES align:NSTextAlignmentLeft];
+        [self drawText:self.parsecStateMessage rect:CGRectMake(40, 108, 880, 48) size:20
                  color:(self.parsecStateIsError ? ColorHex(0xF2B8B5) : ColorHex(0xCAC4D0)) bold:NO align:NSTextAlignmentLeft];
+
+        auto idxFocus = ^BOOL(NSInteger expectedIdx) {
+            return (self.selectedMenuIndex == expectedIdx);
+        };
 
         if (self.parsecConnecting)
         {
-            [self drawButton:CGRectMake(310, 320, 300, 68) canvas:sz buttonId:@"connect_cancel" title:@"Cancel Connection"
-                    selected:NO outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
+            [self drawButton:CGRectMake(320, 300, 320, 72) canvas:sz buttonId:@"connect_cancel" title:@"Cancel Connection (B)"
+                    selected:NO xboxFocused:idxFocus(0) outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
         }
         else if (self.showsHostList)
         {
-            NSUInteger count = MIN((NSUInteger)5, self.hosts.count);
+            NSInteger itemIdx = 0;
+            NSUInteger count = MIN((NSUInteger)4, self.hosts.count);
             for (NSUInteger i = 0; i < count; ++i)
             {
                 NSDictionary *h = self.hosts[i];
-                NSString *hName = [h[@"name"] length] > 0 ? h[@"name"] : (h[@"peer_id"] ?: @"Host");
-                NSString *owner = [h[@"user"] isKindOfClass:[NSDictionary class]] ? (h[@"user"][@"name"] ?: @"PC") : @"PC";
+                NSString *hName = [h[@"name"] length] > 0 ? h[@"name"] : (h[@"peer_id"] ?: @"PC");
+                NSString *owner = [h[@"user"] isKindOfClass:[NSDictionary class]] ? (h[@"user"][@"name"] ?: @"Host") : @"Host";
                 NSString *label = [NSString stringWithFormat:@"%@  (%@)", hName, owner];
-                [self drawButton:CGRectMake(48, 156 + i * 74, 824, 62) canvas:sz
+                [self drawButton:CGRectMake(44, 170 + i * 74, 872, 62) canvas:sz
                         buttonId:[NSString stringWithFormat:@"host_%lu", (unsigned long)i]
-                           title:label selected:NO outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
+                           title:label selected:NO xboxFocused:idxFocus(itemIdx++) outlined:NO filled:(i == 0) disabled:NO hitList:_parsecPanelHits];
             }
-            [self drawButton:CGRectMake(48, 560, 260, 64) canvas:sz buttonId:@"hosts_refresh" title:@"Refresh Hosts"
-                    selected:NO outlined:NO filled:NO disabled:self.isHostsBusy hitList:_parsecPanelHits];
-            [self drawButton:CGRectMake(640, 560, 232, 64) canvas:sz buttonId:@"hosts_signout" title:@"Sign Out"
-                    selected:NO outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
+            [self drawButton:CGRectMake(44, 486, 260, 62) canvas:sz buttonId:@"hosts_refresh" title:@"Refresh PCs (X)"
+                    selected:NO xboxFocused:idxFocus(itemIdx++) outlined:YES filled:NO disabled:self.isHostsBusy hitList:_parsecPanelHits];
+            [self drawButton:CGRectMake(330, 486, 190, 62) canvas:sz buttonId:@"ipd_minus"
+                       title:[NSString stringWithFormat:@"Goz - (%.0f%%)", self.lensSpacingRatio * 100.0f]
+                    selected:NO xboxFocused:idxFocus(itemIdx++) outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
+            [self drawButton:CGRectMake(534, 486, 176, 62) canvas:sz buttonId:@"ipd_plus" title:@"Goz +"
+                    selected:NO xboxFocused:idxFocus(itemIdx++) outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
+            [self drawButton:CGRectMake(726, 486, 190, 62) canvas:sz buttonId:@"hosts_signout" title:@"Sign Out"
+                    selected:NO xboxFocused:idxFocus(itemIdx++) outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
         }
         else
         {
-            NSString *emailLabel = self.emailText.length > 0 ? [NSString stringWithFormat:@"Email: %@", self.emailText] : @"Email: Tap to type with Air Keyboard";
-            NSString *stars = [@"" stringByPaddingToLength:self.passwordText.length withString:@"*" startingAtIndex:0];
-            NSString *passLabel = self.passwordText.length > 0 ? [NSString stringWithFormat:@"Password: %@", stars] : @"Password: Tap to type with Air Keyboard";
-
-            [self drawButton:CGRectMake(48, 168, 824, 68) canvas:sz buttonId:@"auth_email" title:emailLabel
-                    selected:(self.inputTarget == InputTarget::ParsecEmail) outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
-            [self drawButton:CGRectMake(48, 256, 824, 68) canvas:sz buttonId:@"auth_pass" title:passLabel
-                    selected:(self.inputTarget == InputTarget::ParsecPassword) outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
-            if (self.requiresTfa)
-            {
-                NSString *tfaLabel = self.tfaText.length > 0 ? [NSString stringWithFormat:@"2FA: %@", self.tfaText] : @"2FA Code: Tap to type";
-                [self drawButton:CGRectMake(48, 344, 824, 68) canvas:sz buttonId:@"auth_tfa" title:tfaLabel
-                        selected:(self.inputTarget == InputTarget::ParsecTfa) outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
-            }
-            [self drawButton:CGRectMake(48, 458, 420, 72) canvas:sz buttonId:@"auth_signin" title:(self.isAuthBusy ? @"Signing In..." : @"Sign In to Parsec")
-                    selected:NO outlined:NO filled:YES disabled:self.isAuthBusy hitList:_parsecPanelHits];
-            [self drawButton:CGRectMake(510, 458, 362, 72) canvas:sz buttonId:@"auth_setup" title:@"iPhone Keyboard Popup"
-                    selected:NO outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
+            NSInteger itemIdx = 0;
+            [self drawButton:CGRectMake(44, 180, 872, 74) canvas:sz buttonId:@"auth_setup"
+                       title:@"Tap Top-Left 'Parsec Setup' on iPhone to Sign In"
+                    selected:NO xboxFocused:idxFocus(itemIdx++) outlined:NO filled:YES disabled:NO hitList:_parsecPanelHits];
+            [self drawButton:CGRectMake(44, 280, 420, 68) canvas:sz buttonId:@"ipd_minus"
+                       title:[NSString stringWithFormat:@"VR Box Goz Araligi - (%.0f%%)", self.lensSpacingRatio * 100.0f]
+                    selected:NO xboxFocused:idxFocus(itemIdx++) outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
+            [self drawButton:CGRectMake(496, 280, 420, 68) canvas:sz buttonId:@"ipd_plus" title:@"VR Box Goz Araligi +"
+                    selected:NO xboxFocused:idxFocus(itemIdx++) outlined:YES filled:NO disabled:NO hitList:_parsecPanelHits];
         }
+
+        [self drawText:@"Xbox Kontrol: D-Pad Up/Dn: Sec | A: Baglan | X: Yenile | D-Pad L/R: VR Box Goz Birlestir | Y: Ortala"
+                  rect:CGRectMake(40, 616, 880, 34) size:18 color:ColorHex(0xA9A3B5) bold:YES align:NSTextAlignmentCenter];
     }];
     self.parsecPanelNode.geometry.firstMaterial.diffuse.contents = img;
 }
 
-- (void)redrawParsecBarWithWidth:(int)w height:(int)h netFail:(BOOL)netFail
+- (void)redrawParsecBar
 {
     _parsecBarHits.clear();
-    CGSize sz = CGSizeMake(1000, 120);
+    CGSize sz = CGSizeMake(1400, 186);
     UIGraphicsImageRenderer *r = [self makeUiRendererWithSize:sz];
+
+    NSString *modeLabel = self.gamepadPassthroughMode
+        ? @"MOD: XBOX OYUN KOLU (View+Menu = Fare)"
+        : @"MOD: FARE / MASAUSTU (Menu = Oyun Kolu)";
+    NSString *statusLine = (self.barToastText.length > 0)
+        ? self.barToastText
+        : [NSString stringWithFormat:@"%@ (%dx%d)  |  %@  |  Goz: %.0f%%  Boyut: %.0f%%",
+           self.connectedHostName, self.hostWidth, self.hostHeight,
+           (self.activeController ? @"Xbox Bagli" : @"Xbox Yok"),
+           self.lensSpacingRatio * 100.0f, self.screenScale * 100.0f];
+    NSString *hintLine = self.gamepadPassthroughMode
+        ? @"Tam Xbox 360 Kolu PC'ye Aktariliyor!  |  View basili tut + [Menu: Fare Modu | Y: Ortala | D-Pad L/R: VR Box Goz | D-Pad U/D: Boyut]"
+        : @"L-Stick: Fare | A: Sol Tik/Surukle | B: Sag Tik | X: Cift Tik | R-Stick: Kaydir | Y: Ortala | D-Pad L/R: Goz | D-Pad U/D: Boyut | LB/RB: Mesafe";
+
     UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
         (void)ctx;
-        [ColorHex(0x211F26, 0.94) setFill];
+        [ColorHex(0x1D1B22, 0.94) setFill];
         [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, sz.width, sz.height) cornerRadius:28] fill];
-        NSString *status = netFail
-            ? [NSString stringWithFormat:@"%@ (weak link)", self.connectedHostName]
-            : [NSString stringWithFormat:@"%@ (%dx%d)", self.connectedHostName, w, h];
-        [self drawText:status rect:CGRectMake(28, 38, 410, 44) size:24 color:ColorHex(0xE6E0E9) bold:YES align:NSTextAlignmentLeft];
-        [self drawButton:CGRectMake(460, 26, 120, 68) canvas:sz buttonId:@"pbar_up" title:@"Up" selected:NO outlined:NO filled:NO disabled:NO hitList:_parsecBarHits];
-        [self drawButton:CGRectMake(594, 26, 136, 68) canvas:sz buttonId:@"pbar_down" title:@"Down" selected:NO outlined:NO filled:NO disabled:NO hitList:_parsecBarHits];
-        [self drawButton:CGRectMake(746, 26, 226, 68) canvas:sz buttonId:@"pbar_disc" title:@"Disconnect" selected:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
+
+        UIColor *topColor = (self.barToastText.length > 0) ? ColorHex(0x80E5A3) : ColorHex(0xE6E0E9);
+        [self drawText:statusLine rect:CGRectMake(26, 16, 1348, 30) size:22 color:topColor bold:YES align:NSTextAlignmentLeft];
+
+        [self drawButton:CGRectMake(24, 56, 400, 58) canvas:sz buttonId:@"bar_mode" title:modeLabel
+                selected:self.gamepadPassthroughMode xboxFocused:NO outlined:NO filled:YES disabled:NO hitList:_parsecBarHits];
+        [self drawButton:CGRectMake(436, 56, 114, 58) canvas:sz buttonId:@"bar_ipd_minus" title:@"Goz -"
+                selected:NO xboxFocused:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
+        [self drawButton:CGRectMake(560, 56, 114, 58) canvas:sz buttonId:@"bar_ipd_plus" title:@"Goz +"
+                selected:NO xboxFocused:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
+        [self drawButton:CGRectMake(686, 56, 118, 58) canvas:sz buttonId:@"bar_sz_minus" title:@"Boyut -"
+                selected:NO xboxFocused:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
+        [self drawButton:CGRectMake(814, 56, 118, 58) canvas:sz buttonId:@"bar_sz_plus" title:@"Boyut +"
+                selected:NO xboxFocused:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
+        [self drawButton:CGRectMake(944, 56, 146, 58) canvas:sz buttonId:@"bar_lock"
+                   title:(self.headLockMode ? @"Kafa Takip" : @"6DoF Sabit")
+                selected:self.headLockMode xboxFocused:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
+        [self drawButton:CGRectMake(1102, 56, 134, 58) canvas:sz buttonId:@"bar_room"
+                   title:(self.passthroughOn ? @"Kamera" : @"Siyah")
+                selected:self.passthroughOn xboxFocused:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
+        [self drawButton:CGRectMake(1248, 56, 128, 58) canvas:sz buttonId:@"bar_disc" title:@"Kes"
+                selected:NO xboxFocused:NO outlined:YES filled:NO disabled:NO hitList:_parsecBarHits];
+
+        [self drawText:hintLine rect:CGRectMake(26, 132, 1348, 34) size:17 color:ColorHex(0xA9A3B5) bold:YES align:NSTextAlignmentCenter];
     }];
     self.parsecBarNode.geometry.firstMaterial.diffuse.contents = img;
-}
-
-- (void)redrawSideBar:(int)slotIdx
-{
-    if (slotIdx < 0 || slotIdx >= kMaxWebMonitors) return;
-    SideMonitorSlot &slot = _sideSlots[slotIdx];
-    slot.barHits.clear();
-
-    CGSize sz = CGSizeMake(1060, 174);
-    UIGraphicsImageRenderer *r = [self makeUiRendererWithSize:sz];
-    UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        (void)ctx;
-        [ColorHex(0x211F26, 0.94) setFill];
-        [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, sz.width, sz.height) cornerRadius:28] fill];
-
-        NSString *p = [NSString stringWithFormat:@"sbar_%d_", slotIdx];
-        [self drawButton:CGRectMake(18, 16, 152, 64) canvas:sz buttonId:[p stringByAppendingString:@"src"]
-                   title:(slot.useParsecStream2 ? @"Src: PC-2" : @"Src: Web")
-                selected:slot.useParsecStream2 outlined:NO filled:NO disabled:NO hitList:slot.barHits];
-        [self drawButton:CGRectMake(180, 16, 66, 64) canvas:sz buttonId:[p stringByAppendingString:@"back"] title:@"<" selected:NO outlined:NO filled:NO disabled:NO hitList:slot.barHits];
-        [self drawButton:CGRectMake(254, 16, 66, 64) canvas:sz buttonId:[p stringByAppendingString:@"fwd"] title:@">" selected:NO outlined:NO filled:NO disabled:NO hitList:slot.barHits];
-        [self drawButton:CGRectMake(328, 16, 94, 64) canvas:sz buttonId:[p stringByAppendingString:@"reload"] title:@"Reload" selected:NO outlined:NO filled:NO disabled:NO hitList:slot.barHits];
-        [self drawButton:CGRectMake(432, 16, 540, 64) canvas:sz buttonId:[p stringByAppendingString:@"url"] title:slot.urlText
-                selected:(self.inputTarget == InputTarget::WebUrl && self.activeSideSlot == slotIdx) outlined:YES filled:NO disabled:NO hitList:slot.barHits];
-        [self drawButton:CGRectMake(982, 16, 60, 64) canvas:sz buttonId:[p stringByAppendingString:@"close"] title:@"X" selected:NO outlined:YES filled:NO disabled:NO hitList:slot.barHits];
-
-        [self drawButton:CGRectMake(18, 94, 160, 64) canvas:sz buttonId:[p stringByAppendingString:@"yt"] title:@"YouTube" selected:NO outlined:NO filled:NO disabled:NO hitList:slot.barHits];
-        [self drawButton:CGRectMake(190, 94, 150, 64) canvas:sz buttonId:[p stringByAppendingString:@"dc"] title:@"Discord" selected:NO outlined:NO filled:NO disabled:NO hitList:slot.barHits];
-        [self drawButton:CGRectMake(352, 94, 150, 64) canvas:sz buttonId:[p stringByAppendingString:@"ai"] title:@"ChatGPT" selected:NO outlined:NO filled:NO disabled:NO hitList:slot.barHits];
-        [self drawButton:CGRectMake(518, 94, 134, 64) canvas:sz buttonId:[p stringByAppendingString:@"up"] title:@"Scroll Up" selected:NO outlined:YES filled:NO disabled:NO hitList:slot.barHits];
-        [self drawButton:CGRectMake(664, 94, 144, 64) canvas:sz buttonId:[p stringByAppendingString:@"dn"] title:@"Scroll Dn" selected:NO outlined:YES filled:NO disabled:NO hitList:slot.barHits];
-        [self drawButton:CGRectMake(824, 94, 218, 64) canvas:sz buttonId:[p stringByAppendingString:@"move"]
-                   title:(self.movingMonitorIndex == slotIdx ? @"Drop Here" : @"Move Monitor")
-                selected:(self.movingMonitorIndex == slotIdx) outlined:NO filled:NO disabled:NO hitList:slot.barHits];
-    }];
-    slot.barNode.geometry.firstMaterial.diffuse.contents = img;
-}
-
-- (void)redrawDockPanel
-{
-    _dockHits.clear();
-    int activeCount = 0;
-    for (int i = 0; i < kMaxWebMonitors; ++i) if (_sideSlots[i].active) activeCount++;
-
-    NSString *sizeTitle = self.screenSizePreset == 0 ? @"Size: Big" : (self.screenSizePreset == 1 ? @"Size: Giant" : @"Size: IMAX");
-
-    CGSize sz = CGSizeMake(1220, 186);
-    UIGraphicsImageRenderer *r = [self makeUiRendererWithSize:sz];
-    UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        (void)ctx;
-        [ColorHex(0x211F26, 0.94) setFill];
-        [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, sz.width, sz.height) cornerRadius:28] fill];
-
-        [self drawButton:CGRectMake(20, 20, 250, 66) canvas:sz buttonId:@"dock_addmon"
-                   title:(activeCount < kMaxWebMonitors ? [NSString stringWithFormat:@"+ Add Monitor (%d/%d)", activeCount, kMaxWebMonitors] : @"Max Monitors (5/5)")
-                selected:NO outlined:NO filled:(activeCount < kMaxWebMonitors) disabled:(activeCount >= kMaxWebMonitors) hitList:_dockHits];
-        [self drawButton:CGRectMake(284, 20, 210, 66) canvas:sz buttonId:@"dock_size" title:sizeTitle
-                selected:(self.screenSizePreset > 0) outlined:NO filled:NO disabled:NO hitList:_dockHits];
-        [self drawButton:CGRectMake(508, 20, 224, 66) canvas:sz buttonId:@"dock_movepc"
-                   title:(self.movingMonitorIndex == -1 ? @"Drop Here" : @"Move Main PC")
-                selected:(self.movingMonitorIndex == -1) outlined:NO filled:NO disabled:NO hitList:_dockHits];
-        [self drawButton:CGRectMake(746, 20, 220, 66) canvas:sz buttonId:@"dock_kb" title:@"Air Keyboard"
-                selected:self.keyboardVisible outlined:NO filled:NO disabled:NO hitList:_dockHits];
-        [self drawButton:CGRectMake(980, 20, 220, 66) canvas:sz buttonId:@"dock_rclick" title:(self.rightClickArmed ? @"Right Click: ON" : @"Right Click")
-                selected:self.rightClickArmed outlined:NO filled:NO disabled:NO hitList:_dockHits];
-
-        [self drawButton:CGRectMake(20, 102, 220, 66) canvas:sz buttonId:@"dock_mute" title:(self.muted ? @"Audio: Muted" : @"Audio: On")
-                selected:self.muted outlined:NO filled:NO disabled:NO hitList:_dockHits];
-        [self drawButton:CGRectMake(254, 102, 254, 66) canvas:sz buttonId:@"dock_handaim" title:(self.handTrackingEnabled ? @"Hands: Pinch ON" : @"Hands: OFF")
-                selected:self.handTrackingEnabled outlined:NO filled:NO disabled:NO hitList:_dockHits];
-        [self drawButton:CGRectMake(522, 102, 260, 66) canvas:sz buttonId:@"dock_recenter" title:@"Recenter Cockpit"
-                selected:NO outlined:YES filled:NO disabled:NO hitList:_dockHits];
-        [self drawButton:CGRectMake(796, 102, 404, 66) canvas:sz buttonId:@"dock_room" title:(self.passthroughOn ? @"Room: Passthrough" : @"Room: VR Grid")
-                selected:self.passthroughOn outlined:NO filled:NO disabled:NO hitList:_dockHits];
-    }];
-    self.dockNode.geometry.firstMaterial.diffuse.contents = img;
-}
-
-- (void)redrawKeyboardPanel
-{
-    _keyboardHits.clear();
-    CGSize sz = CGSizeMake(1280, 560);
-
-    static const KeySpec r0[] = {
-        {"ESC","ESC",1.1f,41},{"1","!",1,30},{"2","@",1,31},{"3","#",1,32},{"4","$",1,33},
-        {"5","%",1,34},{"6","^",1,35},{"7","&",1,36},{"8","*",1,37},{"9","(",1,38},
-        {"0",")",1,39},{"-","_",1,45},{"=","+",1,46},{"BKSP","BKSP",1.5f,42}
-    };
-    static const KeySpec r1[] = {
-        {"TAB","TAB",1.3f,43},{"q","Q",1,20},{"w","W",1,26},{"e","E",1,8},{"r","R",1,21},
-        {"t","T",1,23},{"y","Y",1,28},{"u","U",1,24},{"i","I",1,12},{"o","O",1,18},
-        {"p","P",1,19},{"[","{",1,47},{"]","}",1,48},{"\\","|",1.3f,49}
-    };
-    static const KeySpec r2[] = {
-        {"SHIFT","SHIFT",1.6f,225},{"a","A",1,4},{"s","S",1,22},{"d","D",1,7},{"f","F",1,9},
-        {"g","G",1,10},{"h","H",1,11},{"j","J",1,13},{"k","K",1,14},{"l","L",1,15},
-        {";",":",1,51},{"'","\"",1,52},{"ENTER","ENTER",2.0f,40}
-    };
-    static const KeySpec r3[] = {
-        {"CTRL","CTRL",1.3f,224},{"z","Z",1,29},{"x","X",1,27},{"c","C",1,6},{"v","V",1,25},
-        {"b","B",1,5},{"n","N",1,17},{"m","M",1,16},{",","<",1,54},{".",">",1,55},
-        {"/","?",1,56},{"UP","UP",1.2f,82},{"DEL","DEL",1.1f,76}
-    };
-    static const KeySpec r4[] = {
-        {"ALT","ALT",1.2f,226},{"WIN","WIN",1.2f,227},{".com",".com",1.4f,0},{"https://","https://",1.7f,0},
-        {"SPACE","SPACE",4.2f,44},{"LEFT","LEFT",1.1f,80},{"DOWN","DOWN",1.1f,81},{"RIGHT","RIGHT",1.1f,79}
-    };
-
-    static const KeySpec *const rows[] = {r0, r1, r2, r3, r4};
-    static const int counts[] = {14, 14, 13, 13, 8};
-
-    UIGraphicsImageRenderer *r = [self makeUiRendererWithSize:sz];
-    UIImage *img = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        (void)ctx;
-        [ColorHex(0x211F26, 0.94) setFill];
-        [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, sz.width, sz.height) cornerRadius:30] fill];
-
-        NSString *targetStr = @"Target: Parsec Email";
-        if (self.inputTarget == InputTarget::ParsecPassword) targetStr = @"Target: Parsec Password";
-        else if (self.inputTarget == InputTarget::ParsecTfa) targetStr = @"Target: Parsec 2FA Code";
-        else if (self.inputTarget == InputTarget::WebUrl) targetStr = [NSString stringWithFormat:@"Target: Side Monitor %d URL (Enter opens)", self.activeSideSlot + 1];
-        else if (self.inputTarget == InputTarget::ParsecHost) targetStr = @"Target: Remote PC (Parsec Live)";
-        else if (self.inputTarget == InputTarget::WebPage) targetStr = [NSString stringWithFormat:@"Target: Side Monitor %d Web Input", self.activeSideSlot + 1];
-        [self drawText:targetStr rect:CGRectMake(24, 14, sz.width - 48, 34) size:22 color:ColorHex(0xD0BCFF) bold:YES align:NSTextAlignmentCenter];
-
-        CGFloat usableW = sz.width - 36.0;
-        CGFloat gap = 8.0;
-        CGFloat rowH = 84.0;
-        CGFloat rowStep = 98.0;
-        CGFloat startY = 58.0;
-
-        for (int row = 0; row < 5; ++row)
-        {
-            float totalUnits = 0.0f;
-            for (int i = 0; i < counts[row]; ++i) totalUnits += rows[row][i].units;
-            CGFloat unitW = (usableW - gap * (counts[row] - 1)) / totalUnits;
-            CGFloat x = 20.0;
-            CGFloat y = startY + row * rowStep;
-
-            for (int i = 0; i < counts[row]; ++i)
-            {
-                const KeySpec &k = rows[row][i];
-                CGFloat kw = k.units * unitW;
-                NSString *norm = [NSString stringWithUTF8String:k.normal];
-                NSString *shft = [NSString stringWithUTF8String:k.shift];
-                NSString *cap = self.shiftOn ? shft : norm;
-                BOOL modOn = ([norm isEqualToString:@"SHIFT"] && self.shiftOn) ||
-                             ([norm isEqualToString:@"CTRL"] && self.ctrlOn) ||
-                             ([norm isEqualToString:@"ALT"] && self.altOn) ||
-                             ([norm isEqualToString:@"WIN"] && self.winOn);
-
-                [self drawButton:CGRectMake(x, y, kw, rowH) canvas:sz
-                        buttonId:[NSString stringWithFormat:@"kb_%@", norm]
-                           title:cap selected:modOn outlined:NO filled:NO disabled:NO hitList:_keyboardHits];
-                x += kw + gap;
-            }
-        }
-    }];
-    self.keyboardNode.geometry.firstMaterial.diffuse.contents = img;
 }
 
 @end

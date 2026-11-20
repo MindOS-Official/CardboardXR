@@ -696,7 +696,23 @@ extern "C" void VRParsecSendStreamMousePosition(int streamIndex, int x, int y)
     msg.mouseMotion.x = x;
     msg.mouseMotion.y = y;
     msg.mouseMotion.relative = false;
+    msg.mouseMotion.scaleRelative = false;
     msg.mouseMotion.stream = static_cast<uint8_t>(streamIndex >= 0 && streamIndex < kMaxParsecStreams ? streamIndex : 0);
+    ParsecClientSendMessage(g_parsec, &msg);
+}
+
+extern "C" void VRParsecSendRelativeMouse(int dx, int dy)
+{
+    std::lock_guard<std::mutex> lock(g_parsecMutex);
+    if (!g_parsec)
+        return;
+    ParsecMessage msg{};
+    msg.type = MESSAGE_MOUSE_MOTION;
+    msg.mouseMotion.x = dx;
+    msg.mouseMotion.y = dy;
+    msg.mouseMotion.relative = true;
+    msg.mouseMotion.scaleRelative = false;
+    msg.mouseMotion.stream = 0;
     ParsecClientSendMessage(g_parsec, &msg);
 }
 
@@ -734,6 +750,41 @@ extern "C" void VRParsecSendKey(int usbHidKeyCode, int pressed)
     msg.keyboard.code = static_cast<ParsecKeycode>(usbHidKeyCode);
     msg.keyboard.mod = MOD_NONE;
     msg.keyboard.pressed = pressed != 0;
+    ParsecClientSendMessage(g_parsec, &msg);
+}
+
+extern "C" void VRParsecSendGamepadState(uint16_t buttons,
+                                         int16_t thumbLX,
+                                         int16_t thumbLY,
+                                         int16_t thumbRX,
+                                         int16_t thumbRY,
+                                         uint8_t leftTrigger,
+                                         uint8_t rightTrigger)
+{
+    std::lock_guard<std::mutex> lock(g_parsecMutex);
+    if (!g_parsec)
+        return;
+    ParsecMessage msg{};
+    msg.type = MESSAGE_GAMEPAD_STATE;
+    msg.gamepadState.id = 0;
+    msg.gamepadState.buttons = buttons;
+    msg.gamepadState.thumbLX = thumbLX;
+    msg.gamepadState.thumbLY = thumbLY;
+    msg.gamepadState.thumbRX = thumbRX;
+    msg.gamepadState.thumbRY = thumbRY;
+    msg.gamepadState.leftTrigger = leftTrigger;
+    msg.gamepadState.rightTrigger = rightTrigger;
+    ParsecClientSendMessage(g_parsec, &msg);
+}
+
+extern "C" void VRParsecUnplugGamepad(void)
+{
+    std::lock_guard<std::mutex> lock(g_parsecMutex);
+    if (!g_parsec)
+        return;
+    ParsecMessage msg{};
+    msg.type = MESSAGE_GAMEPAD_UNPLUG;
+    msg.gamepadUnplug.id = 0;
     ParsecClientSendMessage(g_parsec, &msg);
 }
 
