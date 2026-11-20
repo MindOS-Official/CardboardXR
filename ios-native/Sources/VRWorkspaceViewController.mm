@@ -236,7 +236,7 @@ namespace
         simd_float3 colX = simd_make_float3(static_cast<float>(rm.m11), static_cast<float>(rm.m12), static_cast<float>(rm.m13));
         simd_float3 colY = simd_make_float3(static_cast<float>(rm.m21), static_cast<float>(rm.m22), static_cast<float>(rm.m23));
         simd_float3 colZ = simd_make_float3(static_cast<float>(rm.m31), static_cast<float>(rm.m32), static_cast<float>(rm.m33));
-        simd_float3x3 R_ref_from_dev(colX, colY, colZ);
+        simd_float3x3 R_ref_from_dev = simd_matrix(colX, colY, colZ);
 
         // Validate against gravity vector: ref down (0,0,-1) mapped into dev by R_dev_from_ref should match motion.gravity.
         simd_float3 gravDev = simd_make_float3(static_cast<float>(motion.gravity.x),
@@ -249,13 +249,13 @@ namespace
 
         // Screen camera axes expressed in device coordinates (LandscapeLeft vs LandscapeRight)
         simd_float3x3 R_dev_from_cam = (orient == UIInterfaceOrientationLandscapeRight)
-            ? simd_float3x3(simd_make_float3(0, -1, 0), simd_make_float3(1, 0, 0), simd_make_float3(0, 0, 1))
-            : simd_float3x3(simd_make_float3(0, 1, 0), simd_make_float3(-1, 0, 0), simd_make_float3(0, 0, 1));
+            ? simd_matrix(simd_make_float3(0, -1, 0), simd_make_float3(1, 0, 0), simd_make_float3(0, 0, 1))
+            : simd_matrix(simd_make_float3(0, 1, 0), simd_make_float3(-1, 0, 0), simd_make_float3(0, 0, 1));
 
         // SceneKit world from CoreMotion reference frame: X_scn = X_ref, Y_scn = Z_ref, Z_scn = -Y_ref
-        simd_float3x3 R_scn_from_ref(simd_make_float3(1, 0, 0),
-                                     simd_make_float3(0, 0, -1),
-                                     simd_make_float3(0, 1, 0));
+        simd_float3x3 R_scn_from_ref = simd_matrix(simd_make_float3(1, 0, 0),
+                                                   simd_make_float3(0, 0, -1),
+                                                   simd_make_float3(0, 1, 0));
 
         simd_float3x3 R_scn_from_cam = simd_mul(R_scn_from_ref, simd_mul(R_ref_from_dev, R_dev_from_cam));
         simd_quatf q = simd_quaternion(R_scn_from_cam);
@@ -1946,8 +1946,8 @@ namespace
     }
     [alert addAction:[UIAlertAction actionWithTitle:@"Reset VR BOX QR (63mm)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         (void)a;
-        _viewer.interLensDistance = 0.063000f;
-        [[NSUserDefaults standardUserDefaults] setFloat:_viewer.interLensDistance forKey:kPrefQrInterLens];
+        self->_viewer.interLensDistance = 0.063000f;
+        [[NSUserDefaults standardUserDefaults] setFloat:self->_viewer.interLensDistance forKey:kPrefQrInterLens];
         [self rebuildCardboardDistortionRig];
         [self redrawAllPanels];
     }]];
